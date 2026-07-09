@@ -806,6 +806,124 @@ def appendix_buy_strategy_table() -> pd.DataFrame:
         {"전략": "오리지널 듀얼 모멘텀", "대상 ETF": "SPY, EFA, BIL, AGG", "매수 전략": "SPY 12개월 수익률이 BIL보다 높으면 SPY/EFA 중 높은 ETF 100%, 낮거나 같으면 AGG 100%.", "리밸런싱": "월 1회"},
     ])
 
+
+def appendix_strategy_calculation_table() -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "구분": "LAA 고정 75%",
+            "계산 방식": "LAA 배정금액의 25%씩 IWD, GLD, IEF에 배분",
+            "판정 기준": "별도 모멘텀 계산 없음",
+            "앱 반영": "하위전략 비중 × 25%로 목표금액 계산",
+        },
+        {
+            "구분": "LAA 변동 25%",
+            "계산 방식": "S&P500 200일선 하회와 미국 실업률 12개월 평균 상회를 사용자가 O/X로 입력",
+            "판정 기준": "두 조건이 모두 O이면 SHY, 그 외에는 QQQ",
+            "앱 반영": "선택 ETF에 LAA 배정금액의 25% 배분",
+        },
+        {
+            "구분": "VAA 모멘텀 스코어",
+            "계산 방식": "12×1개월 수익률 + 4×3개월 수익률 + 2×6개월 수익률 + 1×12개월 수익률",
+            "판정 기준": "공격형 SPY/EFA/EEM/AGG 4개가 모두 기준 이상이면 공격형 1위, 하나라도 미달이면 안전자산 LQD/IEF/SHY 중 1위",
+            "앱 반영": "Alpha Vantage 월별 조정종가로 1·3·6·12개월 수익률과 점수 자동 계산",
+        },
+        {
+            "구분": "VAA 0점 처리",
+            "계산 방식": "사이드바 옵션이 아니라 전략 탭의 체크박스 값 사용",
+            "판정 기준": "체크 시 0점은 방어 신호, 해제 시 0점 이상도 공격형 조건 충족",
+            "앱 반영": "zero_is_defensive 값으로 공격/방어 판단",
+        },
+        {
+            "구분": "오리지널 듀얼 모멘텀",
+            "계산 방식": "SPY, EFA, BIL의 12개월 수익률 비교",
+            "판정 기준": "SPY > BIL이면 SPY/EFA 중 12개월 수익률 높은 ETF, SPY ≤ BIL이면 AGG",
+            "앱 반영": "선택된 ETF에 ODM 배정금액 100% 배분",
+        },
+        {
+            "구분": "최근 리밸런싱일",
+            "계산 방식": "Google Sheets trades 시트에서 각 전략의 대상 ETF만 필터링한 뒤 그중 가장 최근 trade_date를 사용",
+            "판정 기준": "LAA 고정은 IWD/GLD/IEF 기준, LAA 변동은 QQQ/SHY 기준, VAA는 SPY/EFA/EEM/AGG/LQD/IEF/SHY 기준, ODM은 SPY/EFA/BIL/AGG 기준",
+            "앱 반영": "전략별 대상 ETF 매매일이 없으면 평가 기준일을 임시 적용하고, 일정표에 해당 기준을 함께 표시",
+        },
+        {
+            "구분": "목표 주수/매매 주수",
+            "계산 방식": "목표 주수 = 목표 투자금(USD) ÷ 최근가(USD) 후 소수점 버림",
+            "판정 기준": "매매 필요 주수 = 목표 주수 - 현재 보유 주수",
+            "앱 반영": "양수는 BUY, 음수는 SELL, 0은 HOLD",
+        },
+    ])
+
+
+def latest_trade_date_for_tickers(trades: pd.DataFrame, tickers: List[str], fallback_date: date) -> Tuple[date, str]:
+    """전략별 대상 ETF 목록에 해당하는 매매일지 중 가장 최근 trade_date를 반환합니다."""
+    target_tickers = sorted({str(t).upper().strip() for t in tickers if str(t).strip()})
+    target_text = ", ".join(target_tickers)
+
+    if trades is None or trades.empty or "trade_date" not in trades.columns or "ticker" not in trades.columns:
+        return fallback_date, f"대상 ETF({target_text}) 매매일지 없음 - 평가 기준일 임시 적용"
+
+    filtered = trades.copy()
+    filtered["_ticker"] = filtered["ticker"].astype(str).str.upper().str.strip()
+    filtered = filtered[filtered["_ticker"].isin(target_tickers)]
+
+    if filtered.empty:
+        return fallback_date, f"대상 ETF({target_text}) 매매내역 없음 - 평가 기준일 임시 적용"
+
+    filtered["_trade_date"] = pd.to_datetime(filtered["trade_date"], errors="coerce")
+    filtered = filtered.dropna(subset=["_trade_date"])
+
+    if filtered.empty:
+        return fallback_date, f"대상 ETF({target_text}) 유효한 매매일 없음 - 평가 기준일 임시 적용"
+
+    latest_ts = filtered["_trade_date"].max()
+    latest_date = latest_ts.date()
+    latest_tickers = sorted(filtered.loc[filtered["_trade_date"] == latest_ts, "_ticker"].unique().tolist())
+    latest_ticker_text = ", ".join(latest_tickers)
+    return latest_date, f"대상 ETF({target_text}) 중 최신 매매일 · 해당 티커: {latest_ticker_text}"
+
+
+def strategy_rebalance_dates_from_trades(trades: pd.DataFrame, fallback_date: date) -> Dict[str, Dict[str, object]]:
+    """LAA 고정/변동, VAA, ODM별 최근 리밸런싱일을 각각 계산합니다."""
+    specs = {
+        "laa_fixed": {"label": "LAA 고정자산", "tickers": LAA_FIXED, "cycle": "연 1회"},
+        "laa_variable": {"label": "LAA 변동자산", "tickers": LAA_VARIABLE, "cycle": "월 1회"},
+        "vaa": {"label": "VAA", "tickers": sorted(set(VAA_ATTACK + VAA_SAFE)), "cycle": "월 1회"},
+        "odm": {"label": "오리지널 듀얼 모멘텀", "tickers": ODM_ASSETS, "cycle": "월 1회"},
+    }
+    result: Dict[str, Dict[str, object]] = {}
+    for key, spec in specs.items():
+        last_date, source = latest_trade_date_for_tickers(trades, spec["tickers"], fallback_date)
+        result[key] = {
+            "label": spec["label"],
+            "tickers": spec["tickers"],
+            "cycle": spec["cycle"],
+            "last_date": last_date,
+            "source": source,
+        }
+    return result
+
+
+def rebalance_schedule_preview_by_strategy(strategy_dates: Dict[str, Dict[str, object]], eval_date: date) -> pd.DataFrame:
+    rows = []
+    order = ["laa_fixed", "laa_variable", "vaa", "odm"]
+    for key in order:
+        info = strategy_dates[key]
+        last_date = info["last_date"]
+        cycle = str(info["cycle"])
+        next_date = next_rebalance_date(last_date, cycle)
+        rows.append(
+            {
+                "구분": info["label"],
+                "대상 ETF": ", ".join(info["tickers"]),
+                "주기": cycle,
+                "최근 리밸런싱일": last_date,
+                "다음 리밸런싱일": next_date,
+                "상태": rebalance_status(next_date, eval_date),
+                "적용 기준": info["source"],
+            }
+        )
+    return pd.DataFrame(rows)
+
 # =========================================================
 # 매매일지 일괄 입력 유틸
 # =========================================================
@@ -965,12 +1083,13 @@ except Exception as e:
     st.stop()
 
 positions_base = calculate_positions_from_trades(trades_df)
+strategy_rebalance_dates = strategy_rebalance_dates_from_trades(trades_df, eval_date)
 # 중요: 앱 로딩/매매일지 저장 직후에는 Alpha Vantage를 호출하지 않습니다.
 # 세션에 저장된 최신가가 있을 때만 현재 자산 평가에 사용합니다.
 portfolio_quotes = get_cached_quotes_for_tickers(positions_base["ticker"].tolist()) if not positions_base.empty else pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date", "source", "fetched_at"])
 portfolio_status, portfolio_summary = build_portfolio_status(positions_base, portfolio_quotes, cash_balance, usdkrw_rate)
 
-tab_assets, tab_strategy, tab_setup = st.tabs(["1) 자산/매매일지", "2) ETF 자산배분 리밸런싱", "3) 설정/배포 가이드"])
+tab_assets, tab_strategy = st.tabs(["1) 자산/매매일지", "2) ETF 자산배분 리밸런싱"])
 
 # =========================================================
 # 1) 자산/매매일지
@@ -1187,8 +1306,20 @@ with tab_assets:
 # =========================================================
 with tab_strategy:
     st.subheader("ETF 전략 입력")
-    with st.expander("전략 구성 확인", expanded=False):
-        st.dataframe(appendix_buy_strategy_table(), use_container_width=True, hide_index=True)
+    with st.expander("Appendix. 매수전략 / 모멘텀 스코어 / 리밸런싱 계산 방식", expanded=False):
+        app_tab1, app_tab2 = st.tabs(["매수 전략 요약", "계산 방식 상세"])
+        with app_tab1:
+            st.dataframe(appendix_buy_strategy_table(), use_container_width=True, hide_index=True)
+        with app_tab2:
+            st.dataframe(appendix_strategy_calculation_table(), use_container_width=True, hide_index=True)
+
+    st.markdown("#### 최근 리밸런싱일")
+    st.info(
+        "최근 리밸런싱일은 전체 매매일지의 최신 날짜 하나를 공통 적용하지 않고, "
+        "각 전략의 대상 ETF 매매내역만 필터링한 뒤 전략별로 가장 최근 매매일을 자동 적용합니다."
+    )
+    schedule_preview = rebalance_schedule_preview_by_strategy(strategy_rebalance_dates, eval_date)
+    st.dataframe(schedule_preview, use_container_width=True, hide_index=True)
 
     s1, s2 = st.columns(2)
     with s1:
@@ -1209,12 +1340,11 @@ with tab_strategy:
             format_func=lambda x: "X: 조건 미충족 → QQQ" if not x else "O: 조건 충족 → SHY",
             index=0,
         )
-        default_monthly_last = today - relativedelta(months=1)
-        default_annual_last = today - relativedelta(years=1)
-        laa_annual_last = st.date_input("LAA 고정자산 최근 리밸런싱일", value=default_annual_last)
-        laa_monthly_last = st.date_input("LAA 변동자산 최근 리밸런싱일", value=default_monthly_last)
-        vaa_monthly_last = st.date_input("VAA 최근 리밸런싱일", value=default_monthly_last)
-        odm_monthly_last = st.date_input("오리지널 듀얼 모멘텀 최근 리밸런싱일", value=default_monthly_last)
+        laa_annual_last = strategy_rebalance_dates["laa_fixed"]["last_date"]
+        laa_monthly_last = strategy_rebalance_dates["laa_variable"]["last_date"]
+        vaa_monthly_last = strategy_rebalance_dates["vaa"]["last_date"]
+        odm_monthly_last = strategy_rebalance_dates["odm"]["last_date"]
+        st.caption("최근 리밸런싱일은 위 일정표의 전략별 대상 ETF 최신 매매일을 자동 사용합니다.")
         zero_is_defensive = st.checkbox("VAA 모멘텀 스코어 0점은 방어 신호로 처리", value=True)
         use_cached_quotes_first = st.checkbox(
             "수동/세션 저장 최신가 우선 사용",
@@ -1377,49 +1507,3 @@ with tab_strategy:
 
         csv = plan.to_csv(index=False, encoding="utf-8-sig")
         st.download_button("리밸런싱 주문안 CSV 다운로드", data=csv, file_name=f"rebalance_plan_{actual_eval_dt.strftime('%Y%m%d')}.csv", mime="text/csv")
-
-# =========================================================
-# 3) 설정/배포 가이드
-# =========================================================
-with tab_setup:
-    st.subheader("Google Sheets 저장 구조")
-    st.markdown(
-        """
-        이 앱은 Google Sheets 안에 다음 시트를 자동으로 만들고 사용합니다.
-
-        - `cash`: 현재 현금 잔고를 저장합니다. 마지막 행을 현재 현금으로 사용합니다.
-        - `trades`: 매매일지를 저장합니다. `BUY`는 수량 증가, `SELL`은 수량 감소, `ADJUST`는 수량 보정입니다. 매매일지 입력 폼에서 입력란을 추가해 여러 건을 한 번에 저장할 수 있습니다.
-        - 매매일지 저장/수정만으로는 Alpha Vantage를 호출하지 않습니다. 최신가는 `현재 보유종목 최신가 조회` 또는 `ETF 전략 계산 및 현재 보유수량 반영` 버튼을 누를 때만 조회합니다.
-        - 보유종목 최신가는 수동으로도 입력할 수 있습니다. 수동 최신가는 이번 앱 세션에만 임시 저장되며 총자산/리밸런싱 계산에 우선 사용할 수 있습니다.
-
-        GitHub에는 코드만 저장하고, API Key와 Google 서비스 계정 JSON은 Streamlit Secrets에만 저장하세요.
-        """
-    )
-    st.code(
-        '''ALPHA_VANTAGE_API_KEY = "YOUR_ALPHA_VANTAGE_KEY"
-GOOGLE_SHEET_ID = "YOUR_GOOGLE_SHEET_ID"
-
-[gcp_service_account]
-type = "service_account"
-project_id = "..."
-private_key_id = "..."
-private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
-client_email = "your-service-account@your-project.iam.gserviceaccount.com"
-client_id = "..."
-auth_uri = "https://accounts.google.com/o/oauth2/auth"
-token_uri = "https://oauth2.googleapis.com/token"
-auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-client_x509_cert_url = "..."
-universe_domain = "googleapis.com"''',
-        language="toml",
-    )
-    st.markdown(
-        """
-        설정 순서
-
-        1. Google Cloud에서 서비스 계정을 만들고 JSON Key를 발급합니다.
-        2. 빈 Google Sheet를 만들고, 서비스 계정의 `client_email`을 해당 Sheet에 편집자로 공유합니다.
-        3. GitHub 저장소에는 `app.py`, `requirements.txt`만 올립니다.
-        4. Streamlit Community Cloud에서 앱을 배포하고, Secrets 메뉴에 위 형식으로 값을 저장합니다.
-        """
-    )
