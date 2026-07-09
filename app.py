@@ -214,6 +214,19 @@ def append_sheet_row(sheet_name: str, columns: List[str], row: Dict[str, object]
     ws.append_row(values, value_input_option="USER_ENTERED")
 
 
+def append_sheet_rows(sheet_name: str, columns: List[str], rows: List[Dict[str, object]]) -> None:
+    """여러 행을 한 번에 Google Sheets에 추가합니다.
+
+    gspread의 append_rows를 사용해 여러 건의 매매일지를 한 번에 저장하므로,
+    1건씩 저장하는 것보다 Google Sheets API 호출 수를 줄일 수 있습니다.
+    """
+    if not rows:
+        return
+    ws = ensure_worksheet(sheet_name, columns)
+    values = [[row.get(col, "") for col in columns] for row in rows]
+    ws.append_rows(values, value_input_option="USER_ENTERED")
+
+
 def overwrite_sheet(sheet_name: str, columns: List[str], df: pd.DataFrame) -> None:
     ws = ensure_worksheet(sheet_name, columns)
     clean = df.copy()
@@ -641,6 +654,90 @@ def appendix_buy_strategy_table() -> pd.DataFrame:
     ])
 
 # =========================================================
+# 매매일지 일괄 입력 유틸
+# =========================================================
+def make_empty_trade_row(default_date: date) -> Dict[str, object]:
+    return {
+        "trade_date": default_date,
+        "ticker": "",
+        "side": "BUY",
+        "quantity": 0.0,
+        "price_usd": 0.0,
+        "fee_usd": 0.0,
+        "memo": "",
+    }
+
+
+def normalize_trade_date(value) -> str:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, datetime):
+        return value.date().strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return ""
+    return parsed.date().strftime("%Y-%m-%d")
+
+
+def prepare_batch_trade_rows(edited_df: pd.DataFrame) -> Tuple[List[Dict[str, object]], List[str]]:
+    """data_editor 입력값을 Google Sheets 저장용 행으로 변환하고 검증합니다."""
+    rows: List[Dict[str, object]] = []
+    errors: List[str] = []
+
+    if edited_df is None or edited_df.empty:
+        return rows, errors
+
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for idx, row in edited_df.reset_index(drop=True).iterrows():
+        row_no = idx + 1
+        ticker = str(row.get("ticker", "") or "").upper().strip()
+        side = str(row.get("side", "") or "").upper().strip()
+        trade_date_text = normalize_trade_date(row.get("trade_date"))
+        quantity = pd.to_numeric(row.get("quantity", 0), errors="coerce")
+        price_usd = pd.to_numeric(row.get("price_usd", 0), errors="coerce")
+        fee_usd = pd.to_numeric(row.get("fee_usd", 0), errors="coerce")
+        memo = str(row.get("memo", "") or "").strip()
+
+        # 완전히 빈 행은 저장하지 않습니다.
+        is_blank = (not ticker) and (pd.isna(quantity) or float(quantity or 0) == 0) and (pd.isna(price_usd) or float(price_usd or 0) == 0) and not memo
+        if is_blank:
+            continue
+
+        if not trade_date_text:
+            errors.append(f"{row_no}행: 매매일을 입력하세요.")
+        if not ticker:
+            errors.append(f"{row_no}행: 티커를 입력하세요.")
+        if side not in ["BUY", "SELL", "ADJUST"]:
+            errors.append(f"{row_no}행: 구분은 BUY, SELL, ADJUST 중 하나여야 합니다.")
+        if pd.isna(quantity):
+            errors.append(f"{row_no}행: 수량을 숫자로 입력하세요.")
+        elif side in ["BUY", "SELL"] and float(quantity) <= 0:
+            errors.append(f"{row_no}행: BUY/SELL 수량은 0보다 커야 합니다.")
+        if pd.isna(price_usd):
+            errors.append(f"{row_no}행: 체결가를 숫자로 입력하세요.")
+        if pd.isna(fee_usd):
+            errors.append(f"{row_no}행: 수수료를 숫자로 입력하세요.")
+
+        if errors and any(err.startswith(f"{row_no}행:") for err in errors):
+            continue
+
+        rows.append({
+            "trade_date": trade_date_text,
+            "ticker": ticker,
+            "side": side,
+            "quantity": float(quantity),
+            "price_usd": float(price_usd),
+            "fee_usd": float(fee_usd),
+            "memo": memo,
+            "created_at": now_text,
+        })
+
+    return rows, errors
+
+
+# =========================================================
 # 화면 시작
 # =========================================================
 st.title("미국 주식 자산관리 + ETF 자산배분 리밸런싱")
@@ -776,6 +873,56 @@ with tab_assets:
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
             st.success(f"{ticker} {side} 내역을 저장했습니다. 새로고침하면 반영됩니다.")
+            st.rerun()
+
+    st.markdown("#### 매매일지 여러 건 한꺼번에 입력")
+    st.caption("입력란 추가 버튼으로 행을 늘린 뒤, 여러 매수/매도/보정 내역을 한 번에 저장할 수 있습니다. 완전히 빈 행은 자동으로 제외됩니다.")
+
+    if "batch_trade_rows" not in st.session_state:
+        st.session_state["batch_trade_rows"] = [make_empty_trade_row(today) for _ in range(3)]
+
+    bc1, bc2, bc3 = st.columns([1, 1, 4])
+    if bc1.button("입력란 추가"):
+        st.session_state["batch_trade_rows"].append(make_empty_trade_row(today))
+        st.rerun()
+    if bc2.button("입력란 5개 추가"):
+        st.session_state["batch_trade_rows"].extend([make_empty_trade_row(today) for _ in range(5)])
+        st.rerun()
+    if bc3.button("입력란 초기화"):
+        st.session_state["batch_trade_rows"] = [make_empty_trade_row(today) for _ in range(3)]
+        st.rerun()
+
+    batch_df = pd.DataFrame(st.session_state["batch_trade_rows"])
+    batch_edited = st.data_editor(
+        batch_df,
+        key="batch_trade_editor",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "trade_date": st.column_config.DateColumn("매매일", format="YYYY-MM-DD", required=False),
+            "ticker": st.column_config.TextColumn("티커", help="예: SPY, QQQ, AAPL"),
+            "side": st.column_config.SelectboxColumn("구분", options=["BUY", "SELL", "ADJUST"], required=False),
+            "quantity": st.column_config.NumberColumn("수량", min_value=None, step=1.0, format="%.6f"),
+            "price_usd": st.column_config.NumberColumn("체결가(USD)", min_value=0.0, step=0.01, format="%.4f"),
+            "fee_usd": st.column_config.NumberColumn("수수료(USD)", min_value=0.0, step=0.01, format="%.4f"),
+            "memo": st.column_config.TextColumn("메모"),
+        },
+    )
+
+    if st.button("여러 건 한꺼번에 저장", type="primary"):
+        rows_to_save, batch_errors = prepare_batch_trade_rows(batch_edited)
+        if batch_errors:
+            st.error("저장 전 아래 내용을 확인하세요.")
+            for err in batch_errors:
+                st.write(f"- {err}")
+        elif not rows_to_save:
+            st.warning("저장할 매매일지가 없습니다. 티커와 수량을 입력하세요.")
+        else:
+            append_sheet_rows("trades", TRADE_COLUMNS, rows_to_save)
+            st.session_state["batch_trade_rows"] = [make_empty_trade_row(today) for _ in range(3)]
+            st.success(f"매매일지 {len(rows_to_save)}건을 Google Sheets에 한꺼번에 저장했습니다.")
+            st.rerun()
 
     st.markdown("#### 종목별 보유 현황")
     show_portfolio = portfolio_status.copy()
@@ -978,7 +1125,7 @@ with tab_setup:
         이 앱은 Google Sheets 안에 다음 시트를 자동으로 만들고 사용합니다.
 
         - `cash`: 현재 현금 잔고를 저장합니다. 마지막 행을 현재 현금으로 사용합니다.
-        - `trades`: 매매일지를 저장합니다. `BUY`는 수량 증가, `SELL`은 수량 감소, `ADJUST`는 수량 보정입니다.
+        - `trades`: 매매일지를 저장합니다. `BUY`는 수량 증가, `SELL`은 수량 감소, `ADJUST`는 수량 보정입니다. 1건 입력과 여러 건 일괄 입력을 모두 지원합니다.
 
         GitHub에는 코드만 저장하고, API Key와 Google 서비스 계정 JSON은 Streamlit Secrets에만 저장하세요.
         """
