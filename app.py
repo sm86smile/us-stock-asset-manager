@@ -360,14 +360,14 @@ def fetch_global_quote(symbol: str, api_key: str) -> Dict[str, object]:
     latest_trading_day = quote.get("07. latest trading day")
     if pd.isna(price) or float(price) <= 0:
         raise ValueError(f"{symbol}: 유효한 최신 가격을 찾지 못했습니다.")
-    return {"ticker": symbol, "latest_price_usd": float(price), "price_date": latest_trading_day or "-"}
+    return {"ticker": symbol, "latest_price_usd": float(price), "price_date": latest_trading_day or "-", "source": "API"}
 
 
 def load_latest_quotes(tickers: List[str], api_key: str) -> pd.DataFrame:
     rows, errors = [], []
     tickers = sorted(set([str(t).upper().strip() for t in tickers if str(t).strip()]))
     if not tickers:
-        return pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date"])
+        return pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date", "source"])
 
     progress = st.progress(0, text="최신 종가를 불러오는 중입니다.")
     for i, ticker in enumerate(tickers, start=1):
@@ -375,7 +375,7 @@ def load_latest_quotes(tickers: List[str], api_key: str) -> pd.DataFrame:
             rows.append(fetch_global_quote(ticker, api_key))
         except Exception as e:
             errors.append(str(e))
-            rows.append({"ticker": ticker, "latest_price_usd": pd.NA, "price_date": "-"})
+            rows.append({"ticker": ticker, "latest_price_usd": pd.NA, "price_date": "-", "source": "API_ERROR"})
         progress.progress(i / len(tickers), text=f"최신 가격 로딩: {ticker} ({i}/{len(tickers)})")
         if i < len(tickers):
             time.sleep(API_CALL_DELAY_SECONDS)
@@ -391,7 +391,7 @@ def load_latest_quotes(tickers: List[str], api_key: str) -> pd.DataFrame:
 
 def get_cached_quotes_for_tickers(tickers: List[str]) -> pd.DataFrame:
     """세션에 저장된 최신가만 읽습니다. 이 함수는 Alpha Vantage를 호출하지 않습니다."""
-    cols = ["ticker", "latest_price_usd", "price_date", "fetched_at"]
+    cols = ["ticker", "latest_price_usd", "price_date", "source", "fetched_at"]
     cached = st.session_state.get("latest_quotes_df")
     if cached is None or not isinstance(cached, pd.DataFrame) or cached.empty:
         return pd.DataFrame(columns=cols)
@@ -415,6 +415,9 @@ def store_latest_quotes(quotes: pd.DataFrame) -> None:
 
     new_quotes = quotes.copy()
     new_quotes["ticker"] = new_quotes["ticker"].astype(str).str.upper().str.strip()
+    if "source" not in new_quotes.columns:
+        new_quotes["source"] = "API"
+    new_quotes["source"] = new_quotes["source"].fillna("API").astype(str)
     new_quotes["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     cached = st.session_state.get("latest_quotes_df")
@@ -434,8 +437,108 @@ def quote_cache_info(quotes: pd.DataFrame) -> str:
     fetched_values = [str(x) for x in quotes["fetched_at"].dropna().unique().tolist() if str(x).strip()]
     if not fetched_values:
         return "최신가 미조회"
-    return f"세션 저장 최신가 사용 / 최근 조회: {max(fetched_values)}"
+    sources = []
+    if "source" in quotes.columns:
+        sources = [str(x) for x in quotes["source"].dropna().unique().tolist() if str(x).strip()]
+    source_text = f" / 출처: {', '.join(sorted(set(sources)))}" if sources else ""
+    return f"세션 저장 최신가 사용 / 최근 조회: {max(fetched_values)}{source_text}"
 
+
+
+
+def build_manual_quote_template(positions: pd.DataFrame, cached_quotes: pd.DataFrame, today_value: date) -> pd.DataFrame:
+    """보유종목 기준 수동 최신가 입력용 표를 만듭니다. 이 함수는 API를 호출하지 않습니다."""
+    cols = ["ticker", "latest_price_usd", "price_date"]
+    if positions is None or positions.empty:
+        return pd.DataFrame(columns=cols)
+
+    base = positions[["ticker"]].copy()
+    base["ticker"] = base["ticker"].astype(str).str.upper().str.strip()
+    base = base.drop_duplicates(subset=["ticker"]).sort_values("ticker")
+
+    if cached_quotes is not None and not cached_quotes.empty:
+        cached = cached_quotes.copy()
+        cached["ticker"] = cached["ticker"].astype(str).str.upper().str.strip()
+        cached = cached.drop_duplicates(subset=["ticker"], keep="last")
+        keep_cols = [c for c in ["ticker", "latest_price_usd", "price_date"] if c in cached.columns]
+        base = base.merge(cached[keep_cols], on="ticker", how="left")
+    else:
+        base["latest_price_usd"] = 0.0
+        base["price_date"] = today_value.strftime("%Y-%m-%d")
+
+    if "latest_price_usd" not in base.columns:
+        base["latest_price_usd"] = 0.0
+    if "price_date" not in base.columns:
+        base["price_date"] = today_value.strftime("%Y-%m-%d")
+
+    base["latest_price_usd"] = pd.to_numeric(base["latest_price_usd"], errors="coerce").fillna(0.0)
+    base["price_date"] = base["price_date"].fillna(today_value.strftime("%Y-%m-%d")).astype(str)
+    return base[cols]
+
+
+def normalize_manual_quotes(input_df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    """수동 입력 최신가 표를 세션 저장용 quote_df로 정리합니다."""
+    errors: List[str] = []
+    rows: List[Dict[str, object]] = []
+
+    if input_df is None or input_df.empty:
+        return pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date", "source"]), ["수동 입력할 종목이 없습니다."]
+
+    for idx, row in input_df.iterrows():
+        ticker = str(row.get("ticker", "") or "").upper().strip()
+        price = pd.to_numeric(row.get("latest_price_usd", pd.NA), errors="coerce")
+        price_date = str(row.get("price_date", "") or "").strip()
+
+        if not ticker and (pd.isna(price) or float(price or 0) == 0):
+            continue
+        if not ticker:
+            errors.append(f"{idx + 1}번 행: 티커를 입력하세요.")
+            continue
+        if pd.isna(price) or float(price) <= 0:
+            errors.append(f"{ticker}: 최신가(USD)는 0보다 커야 합니다.")
+            continue
+        if not price_date:
+            price_date = datetime.now().strftime("%Y-%m-%d")
+
+        rows.append({
+            "ticker": ticker,
+            "latest_price_usd": float(price),
+            "price_date": price_date,
+            "source": "MANUAL",
+        })
+
+    if not rows and not errors:
+        errors.append("저장할 수동 최신가가 없습니다. 가격을 입력하세요.")
+
+    return pd.DataFrame(rows, columns=["ticker", "latest_price_usd", "price_date", "source"]), errors
+
+
+def combine_cached_and_api_quotes(quote_tickers: List[str], api_key: str, use_cached_first: bool) -> pd.DataFrame:
+    """리밸런싱용 가격표를 만듭니다. 수동/세션 저장 가격을 우선 쓰고 부족한 종목만 API로 조회할 수 있습니다."""
+    tickers = sorted(set([str(t).upper().strip() for t in quote_tickers if str(t).strip()]))
+    if not tickers:
+        return pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date", "source", "fetched_at"])
+
+    if not use_cached_first:
+        api_quotes = load_latest_quotes(tickers, api_key)
+        store_latest_quotes(api_quotes)
+        return get_cached_quotes_for_tickers(tickers)
+
+    cached = get_cached_quotes_for_tickers(tickers)
+    cached_valid = cached.dropna(subset=["latest_price_usd"]).copy() if not cached.empty else pd.DataFrame()
+    cached_valid["latest_price_usd"] = pd.to_numeric(cached_valid.get("latest_price_usd", pd.Series(dtype=float)), errors="coerce") if not cached_valid.empty else pd.Series(dtype=float)
+    cached_valid = cached_valid[cached_valid["latest_price_usd"] > 0] if not cached_valid.empty else cached_valid
+    cached_tickers = set(cached_valid["ticker"].astype(str).str.upper().str.strip().tolist()) if not cached_valid.empty else set()
+    missing = [t for t in tickers if t not in cached_tickers]
+
+    if missing:
+        st.info(f"수동/세션 저장 최신가가 없는 {len(missing)}개 티커만 API로 조회합니다: {', '.join(missing)}")
+        api_quotes = load_latest_quotes(missing, api_key)
+        store_latest_quotes(api_quotes)
+    else:
+        st.info("모든 리밸런싱 대상 티커에 수동/세션 저장 최신가가 있어 가격 API 조회를 생략합니다.")
+
+    return get_cached_quotes_for_tickers(tickers)
 
 def load_all_monthly_prices(tickers: List[str], api_key: str) -> Dict[str, pd.DataFrame]:
     result, errors = {}, []
@@ -505,7 +608,7 @@ def calculate_positions_from_trades(trades: pd.DataFrame) -> pd.DataFrame:
 def build_portfolio_status(positions: pd.DataFrame, quotes: pd.DataFrame, cash: Dict[str, float], usdkrw_rate: float) -> Tuple[pd.DataFrame, Dict[str, float]]:
     pos = positions.copy() if not positions.empty else pd.DataFrame(columns=["ticker", "quantity", "avg_buy_price_usd"])
     if quotes.empty:
-        quotes = pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date"])
+        quotes = pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date", "source"])
     pos = pos.merge(quotes, on="ticker", how="left")
     pos["market_value_usd"] = pos["quantity"] * pd.to_numeric(pos["latest_price_usd"], errors="coerce")
     pos["market_value_krw"] = pos["market_value_usd"] * usdkrw_rate
@@ -864,7 +967,7 @@ except Exception as e:
 positions_base = calculate_positions_from_trades(trades_df)
 # 중요: 앱 로딩/매매일지 저장 직후에는 Alpha Vantage를 호출하지 않습니다.
 # 세션에 저장된 최신가가 있을 때만 현재 자산 평가에 사용합니다.
-portfolio_quotes = get_cached_quotes_for_tickers(positions_base["ticker"].tolist()) if not positions_base.empty else pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date", "fetched_at"])
+portfolio_quotes = get_cached_quotes_for_tickers(positions_base["ticker"].tolist()) if not positions_base.empty else pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date", "source", "fetched_at"])
 portfolio_status, portfolio_summary = build_portfolio_status(positions_base, portfolio_quotes, cash_balance, usdkrw_rate)
 
 tab_assets, tab_strategy, tab_setup = st.tabs(["1) 자산/매매일지", "2) ETF 자산배분 리밸런싱", "3) 설정/배포 가이드"])
@@ -887,15 +990,43 @@ with tab_assets:
             portfolio_status, portfolio_summary = build_portfolio_status(positions_base, portfolio_quotes, cash_balance, usdkrw_rate)
             st.success("현재 보유종목 최신가를 조회해 이번 세션에 저장했습니다.")
     if refresh_cols[1].button("저장된 최신가 지우기"):
-        st.session_state["latest_quotes_df"] = pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date", "fetched_at"])
+        st.session_state["latest_quotes_df"] = pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date", "source", "fetched_at"])
         portfolio_quotes = get_cached_quotes_for_tickers(positions_base["ticker"].tolist())
         portfolio_status, portfolio_summary = build_portfolio_status(positions_base, portfolio_quotes, cash_balance, usdkrw_rate)
         st.success("이번 세션에 저장된 최신가를 지웠습니다.")
 
+    if not positions_base.empty:
+        with st.expander("종목별 최신가 수동 입력으로 임시 총자산 계산", expanded=portfolio_quotes.empty):
+            st.caption("Alpha Vantage를 호출하지 않고 보유종목별 최신가를 직접 입력해 이번 세션의 임시 평가액과 총자산을 계산합니다. 입력값은 Google Sheets에 저장되지 않으며, 앱 세션에만 저장됩니다.")
+            manual_template = build_manual_quote_template(positions_base, portfolio_quotes, today)
+            manual_edited = st.data_editor(
+                manual_template,
+                key="manual_quote_editor",
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                column_config={
+                    "ticker": st.column_config.TextColumn("티커", disabled=True),
+                    "latest_price_usd": st.column_config.NumberColumn("수동 최신가(USD)", min_value=0.0, step=0.01, format="%.4f"),
+                    "price_date": st.column_config.TextColumn("가격 기준일", help="예: 2026-07-10 또는 임시"),
+                },
+            )
+            if st.button("수동 최신가로 임시 총자산 계산", type="secondary"):
+                manual_quotes, manual_errors = normalize_manual_quotes(manual_edited)
+                if manual_errors:
+                    st.error("수동 최신가 저장 전 아래 내용을 확인하세요.")
+                    for err in manual_errors:
+                        st.write(f"- {err}")
+                else:
+                    store_latest_quotes(manual_quotes)
+                    portfolio_quotes = get_cached_quotes_for_tickers(positions_base["ticker"].tolist())
+                    portfolio_status, portfolio_summary = build_portfolio_status(positions_base, portfolio_quotes, cash_balance, usdkrw_rate)
+                    st.success(f"수동 최신가 {len(manual_quotes)}건으로 임시 총자산을 계산했습니다. API 호출은 발생하지 않았습니다.")
+
     if positions_base.empty:
         st.info("아직 보유종목이 없습니다. 현금 또는 매매일지를 입력하세요.")
     elif portfolio_quotes.empty:
-        st.warning("최신가를 아직 조회하지 않았습니다. 아래 총자산은 현금 위주로 표시되며, 주식 평가액은 리밸런싱 계산 버튼을 누를 때 한 번에 조회됩니다.")
+        st.warning("최신가를 아직 조회/입력하지 않았습니다. 아래 총자산은 현금 위주로 표시되며, 주식 평가액은 수동 최신가 입력 또는 리밸런싱 계산 버튼을 누를 때 반영됩니다.")
     else:
         st.info(quote_cache_info(portfolio_quotes))
 
@@ -1029,6 +1160,7 @@ with tab_assets:
             "ticker": "티커", "quantity": "보유수량", "avg_buy_price_usd": "평균매수가(USD)",
             "latest_price_usd": "최근가(USD)", "price_date": "가격 기준일", "market_value_usd": "평가액(USD)",
             "market_value_krw": "평가액(KRW)", "weight": "비중", "unrealized_pnl_usd": "평가손익(USD)", "unrealized_pnl_pct": "평가손익률",
+            "source": "가격 출처", "fetched_at": "입력/조회시각",
         })
         for col in ["평균매수가(USD)", "최근가(USD)"]:
             show_portfolio[col] = show_portfolio[col].apply(usd_price)
@@ -1084,6 +1216,11 @@ with tab_strategy:
         vaa_monthly_last = st.date_input("VAA 최근 리밸런싱일", value=default_monthly_last)
         odm_monthly_last = st.date_input("오리지널 듀얼 모멘텀 최근 리밸런싱일", value=default_monthly_last)
         zero_is_defensive = st.checkbox("VAA 모멘텀 스코어 0점은 방어 신호로 처리", value=True)
+        use_cached_quotes_first = st.checkbox(
+            "수동/세션 저장 최신가 우선 사용",
+            value=True,
+            help="체크하면 수동 입력 또는 이전 조회 가격이 있는 티커는 재조회하지 않고, 부족한 티커만 Alpha Vantage로 조회합니다.",
+        )
 
     st.markdown("#### 하위전략 비중")
     wc1, wc2, wc3 = st.columns(3)
@@ -1150,8 +1287,7 @@ with tab_strategy:
         # 대상: 전략상 선택 ETF + 현재 보유종목. 이후 현재 총자산과 주문안을 같은 가격표로 계산합니다.
         selected_strategy_tickers = sorted(set(list(laa_inner.keys()) + [vaa_selected, odm_selected]))
         quote_tickers = sorted(set(selected_strategy_tickers + positions_base["ticker"].dropna().astype(str).str.upper().tolist()))
-        quote_df = load_latest_quotes(quote_tickers, api_key)
-        store_latest_quotes(quote_df)
+        quote_df = combine_cached_and_api_quotes(quote_tickers, api_key, use_cached_quotes_first)
         portfolio_status_run, portfolio_summary_run = build_portfolio_status(positions_base, quote_df, cash_balance, usdkrw_rate)
 
         if investment_basis == "현재 포트폴리오 총자산 사용":
@@ -1174,7 +1310,8 @@ with tab_strategy:
         t1, t2, t3 = st.columns(3)
         t1.metric("계산 기준 총자산(USD)", money_usd(total_investment_usd))
         t2.metric("계산 기준 총자산(KRW)", money_krw(total_investment_krw))
-        t3.metric("최신가 조회 티커 수", f"{len(quote_tickers)}개")
+        valid_price_count = quote_df.dropna(subset=["latest_price_usd"]).shape[0] if not quote_df.empty else 0
+        t3.metric("가격 반영 티커 수", f"{valid_price_count}/{len(quote_tickers)}개")
 
         rows: List[Dict[str, object]] = []
         rows += allocation_rows("LAA", w_laa, laa_inner, laa_rebalance, eval_date, total_investment_krw, total_investment_usd, input_currency, laa_reason)
@@ -1253,6 +1390,7 @@ with tab_setup:
         - `cash`: 현재 현금 잔고를 저장합니다. 마지막 행을 현재 현금으로 사용합니다.
         - `trades`: 매매일지를 저장합니다. `BUY`는 수량 증가, `SELL`은 수량 감소, `ADJUST`는 수량 보정입니다. 매매일지 입력 폼에서 입력란을 추가해 여러 건을 한 번에 저장할 수 있습니다.
         - 매매일지 저장/수정만으로는 Alpha Vantage를 호출하지 않습니다. 최신가는 `현재 보유종목 최신가 조회` 또는 `ETF 전략 계산 및 현재 보유수량 반영` 버튼을 누를 때만 조회합니다.
+        - 보유종목 최신가는 수동으로도 입력할 수 있습니다. 수동 최신가는 이번 앱 세션에만 임시 저장되며 총자산/리밸런싱 계산에 우선 사용할 수 있습니다.
 
         GitHub에는 코드만 저장하고, API Key와 Google 서비스 계정 JSON은 Streamlit Secrets에만 저장하세요.
         """
