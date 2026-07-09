@@ -923,82 +923,103 @@ with tab_assets:
         st.success("현금 잔고를 Google Sheets에 저장했습니다. 새로고침하면 반영됩니다.")
 
     st.markdown("#### 매매일지 입력")
+    st.caption("입력란 추가 버튼으로 기존 매매일지 입력 폼 안에서 여러 매수/매도/보정 내역을 한 번에 저장할 수 있습니다. 완전히 빈 행은 자동으로 제외됩니다.")
+
+    if "trade_form_row_count" not in st.session_state:
+        st.session_state["trade_form_row_count"] = 1
+
+    fc1, fc2, fc3, fc4 = st.columns([1, 1, 1, 4])
+    if fc1.button("입력란 추가"):
+        st.session_state["trade_form_row_count"] += 1
+        st.rerun()
+    if fc2.button("입력란 5개 추가"):
+        st.session_state["trade_form_row_count"] += 5
+        st.rerun()
+    if fc3.button("입력란 초기화"):
+        for key in list(st.session_state.keys()):
+            if key.startswith("trade_form_") and key != "trade_form_row_count":
+                del st.session_state[key]
+        st.session_state["trade_form_row_count"] = 1
+        st.rerun()
+
     with st.form("trade_form"):
-        tc1, tc2, tc3, tc4, tc5, tc6 = st.columns([1, 1, 1, 1, 1, 2])
-        trade_date = tc1.date_input("매매일", value=today)
-        ticker = tc2.text_input("티커", value="SPY").upper().strip()
-        side = tc3.selectbox("구분", options=["BUY", "SELL", "ADJUST"], help="ADJUST는 입고/출고/수량 보정용입니다. 수량에 음수를 넣으면 보유수량이 줄어듭니다.")
-        quantity = tc4.number_input("수량", value=1.0, step=1.0, format="%.6f")
-        price_usd = tc5.number_input("체결가(USD)", value=0.0, step=0.01, format="%.4f")
-        fee_usd = tc5.number_input("수수료(USD)", value=0.0, step=0.01, format="%.4f")
-        memo = tc6.text_input("메모", value="")
-        add_trade = st.form_submit_button("매매일지 추가")
-    if add_trade:
-        if not ticker:
-            st.error("티커를 입력하세요.")
-        elif side in ["BUY", "SELL"] and quantity <= 0:
-            st.error("BUY/SELL 수량은 0보다 커야 합니다.")
-        else:
-            append_sheet_row("trades", TRADE_COLUMNS, {
-                "trade_date": trade_date.strftime("%Y-%m-%d"),
+        trade_inputs = []
+        row_count = int(st.session_state.get("trade_form_row_count", 1))
+
+        for i in range(row_count):
+            st.markdown(f"**입력 {i + 1}**")
+            tc1, tc2, tc3, tc4, tc5, tc6 = st.columns([1, 1, 1, 1, 1, 2])
+            trade_date = tc1.date_input("매매일", value=today, key=f"trade_form_date_{i}")
+            ticker = tc2.text_input("티커", value="SPY" if i == 0 else "", key=f"trade_form_ticker_{i}").upper().strip()
+            side = tc3.selectbox(
+                "구분",
+                options=["BUY", "SELL", "ADJUST"],
+                key=f"trade_form_side_{i}",
+                help="ADJUST는 입고/출고/수량 보정용입니다. 수량에 음수를 넣으면 보유수량이 줄어듭니다.",
+            )
+            quantity = tc4.number_input("수량", value=1.0 if i == 0 else 0.0, step=1.0, format="%.6f", key=f"trade_form_quantity_{i}")
+            price_usd = tc5.number_input("체결가(USD)", value=0.0, step=0.01, format="%.4f", key=f"trade_form_price_usd_{i}")
+            fee_usd = tc5.number_input("수수료(USD)", value=0.0, step=0.01, format="%.4f", key=f"trade_form_fee_usd_{i}")
+            memo = tc6.text_input("메모", value="", key=f"trade_form_memo_{i}")
+
+            trade_inputs.append({
+                "row_no": i + 1,
+                "trade_date": trade_date,
                 "ticker": ticker,
                 "side": side,
                 "quantity": quantity,
                 "price_usd": price_usd,
                 "fee_usd": fee_usd,
                 "memo": memo,
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
-            st.success(f"{ticker} {side} 내역을 저장했습니다. 새로고침하면 반영됩니다.")
-            st.rerun()
 
-    st.markdown("#### 매매일지 여러 건 한꺼번에 입력")
-    st.caption("입력란 추가 버튼으로 행을 늘린 뒤, 여러 매수/매도/보정 내역을 한 번에 저장할 수 있습니다. 완전히 빈 행은 자동으로 제외됩니다.")
+        add_trade = st.form_submit_button("매매일지 저장")
 
-    if "batch_trade_rows" not in st.session_state:
-        st.session_state["batch_trade_rows"] = [make_empty_trade_row(today) for _ in range(3)]
+    if add_trade:
+        rows_to_save = []
+        errors = []
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    bc1, bc2, bc3 = st.columns([1, 1, 4])
-    if bc1.button("입력란 추가"):
-        st.session_state["batch_trade_rows"].append(make_empty_trade_row(today))
-        st.rerun()
-    if bc2.button("입력란 5개 추가"):
-        st.session_state["batch_trade_rows"].extend([make_empty_trade_row(today) for _ in range(5)])
-        st.rerun()
-    if bc3.button("입력란 초기화"):
-        st.session_state["batch_trade_rows"] = [make_empty_trade_row(today) for _ in range(3)]
-        st.rerun()
+        for item in trade_inputs:
+            row_no = item["row_no"]
+            ticker = str(item["ticker"] or "").upper().strip()
+            side = str(item["side"] or "").upper().strip()
+            quantity = float(item["quantity"] or 0)
+            price_usd = float(item["price_usd"] or 0)
+            fee_usd = float(item["fee_usd"] or 0)
+            memo = str(item["memo"] or "").strip()
 
-    batch_df = pd.DataFrame(st.session_state["batch_trade_rows"])
-    batch_edited = st.data_editor(
-        batch_df,
-        key="batch_trade_editor",
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        column_config={
-            "trade_date": st.column_config.DateColumn("매매일", format="YYYY-MM-DD", required=False),
-            "ticker": st.column_config.TextColumn("티커", help="예: SPY, QQQ, AAPL"),
-            "side": st.column_config.SelectboxColumn("구분", options=["BUY", "SELL", "ADJUST"], required=False),
-            "quantity": st.column_config.NumberColumn("수량", min_value=None, step=1.0, format="%.6f"),
-            "price_usd": st.column_config.NumberColumn("체결가(USD)", min_value=0.0, step=0.01, format="%.4f"),
-            "fee_usd": st.column_config.NumberColumn("수수료(USD)", min_value=0.0, step=0.01, format="%.4f"),
-            "memo": st.column_config.TextColumn("메모"),
-        },
-    )
+            is_blank = (not ticker) and quantity == 0 and price_usd == 0 and fee_usd == 0 and not memo
+            if is_blank:
+                continue
 
-    if st.button("여러 건 한꺼번에 저장", type="primary"):
-        rows_to_save, batch_errors = prepare_batch_trade_rows(batch_edited)
-        if batch_errors:
+            if not ticker:
+                errors.append(f"{row_no}번 입력란: 티커를 입력하세요.")
+                continue
+            if side in ["BUY", "SELL"] and quantity <= 0:
+                errors.append(f"{row_no}번 입력란: BUY/SELL 수량은 0보다 커야 합니다.")
+                continue
+
+            rows_to_save.append({
+                "trade_date": item["trade_date"].strftime("%Y-%m-%d"),
+                "ticker": ticker,
+                "side": side,
+                "quantity": quantity,
+                "price_usd": price_usd,
+                "fee_usd": fee_usd,
+                "memo": memo,
+                "created_at": created_at,
+            })
+
+        if errors:
             st.error("저장 전 아래 내용을 확인하세요.")
-            for err in batch_errors:
+            for err in errors:
                 st.write(f"- {err}")
         elif not rows_to_save:
             st.warning("저장할 매매일지가 없습니다. 티커와 수량을 입력하세요.")
         else:
             append_sheet_rows("trades", TRADE_COLUMNS, rows_to_save)
-            st.session_state["batch_trade_rows"] = [make_empty_trade_row(today) for _ in range(3)]
-            st.success(f"매매일지 {len(rows_to_save)}건을 Google Sheets에 한꺼번에 저장했습니다.")
+            st.success(f"매매일지 {len(rows_to_save)}건을 Google Sheets에 저장했습니다. 새로고침하면 반영됩니다.")
             st.rerun()
 
     st.markdown("#### 종목별 보유 현황")
@@ -1230,7 +1251,7 @@ with tab_setup:
         이 앱은 Google Sheets 안에 다음 시트를 자동으로 만들고 사용합니다.
 
         - `cash`: 현재 현금 잔고를 저장합니다. 마지막 행을 현재 현금으로 사용합니다.
-        - `trades`: 매매일지를 저장합니다. `BUY`는 수량 증가, `SELL`은 수량 감소, `ADJUST`는 수량 보정입니다. 1건 입력과 여러 건 일괄 입력을 모두 지원합니다.
+        - `trades`: 매매일지를 저장합니다. `BUY`는 수량 증가, `SELL`은 수량 감소, `ADJUST`는 수량 보정입니다. 매매일지 입력 폼에서 입력란을 추가해 여러 건을 한 번에 저장할 수 있습니다.
         - 매매일지 저장/수정만으로는 Alpha Vantage를 호출하지 않습니다. 최신가는 `현재 보유종목 최신가 조회` 또는 `ETF 전략 계산 및 현재 보유수량 반영` 버튼을 누를 때만 조회합니다.
 
         GitHub에는 코드만 저장하고, API Key와 Google 서비스 계정 JSON은 Streamlit Secrets에만 저장하세요.
