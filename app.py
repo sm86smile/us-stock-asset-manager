@@ -24,6 +24,7 @@ st.set_page_config(page_title="미국 주식 자산관리 + ETF 리밸런싱", p
 ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
 API_CALL_DELAY_SECONDS = 1.25
 CACHE_TTL_SECONDS = 12 * 60 * 60
+DEFAULT_USDKRW_RATE = 1380.0  # settings 시트 환율을 읽지 못할 때만 사용하는 내부 기본값
 GSHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # 기존 ETF 자산배분 전략 구성
@@ -352,20 +353,20 @@ def parse_number_from_sheet_value(value: object) -> float:
 
 
 def load_usdkrw_from_settings(default_rate: float, eval_date: date) -> Tuple[float, str, pd.Timestamp]:
-    """settings 시트의 usdkrw_rate 값을 우선 사용하고, 실패하면 수동 입력 환율로 대체합니다."""
+    """settings 시트의 usdkrw_rate 값을 사용하고, 실패하면 앱 내부 기본 환율로 대체합니다."""
     try:
         settings_df = load_settings()
         if settings_df.empty:
-            return float(default_rate), "수동 입력(settings 시트 없음)", pd.Timestamp(eval_date)
+            return float(default_rate), "기본값(settings 시트 없음)", pd.Timestamp(eval_date)
 
         key_series = settings_df["key"].astype(str).str.strip().str.lower()
         rate_rows = settings_df[key_series == "usdkrw_rate"]
         if rate_rows.empty:
-            return float(default_rate), "수동 입력(settings!usdkrw_rate 없음)", pd.Timestamp(eval_date)
+            return float(default_rate), "기본값(settings!usdkrw_rate 없음)", pd.Timestamp(eval_date)
 
         rate = parse_number_from_sheet_value(rate_rows.iloc[-1]["value"])
         if pd.isna(rate) or float(rate) <= 0:
-            return float(default_rate), "수동 입력(settings 환율값 오류)", pd.Timestamp(eval_date)
+            return float(default_rate), "기본값(settings 환율값 오류)", pd.Timestamp(eval_date)
 
         source_rows = settings_df[key_series == "usdkrw_source"]
         source = "Google Sheets GOOGLEFINANCE"
@@ -381,7 +382,7 @@ def load_usdkrw_from_settings(default_rate: float, eval_date: date) -> Tuple[flo
 
         return float(rate), source, rate_date
     except Exception:
-        return float(default_rate), "수동 입력(settings 읽기 실패)", pd.Timestamp(eval_date)
+        return float(default_rate), "기본값(settings 읽기 실패)", pd.Timestamp(eval_date)
 
 
 def _safe_str(value: object) -> str:
@@ -1577,7 +1578,7 @@ with st.sidebar:
         st.error("GOOGLE_SHEET_ID 필요")
     eval_date = st.date_input("평가 기준일", value=today)
     st.markdown("---")
-
+    st.caption("환율은 Alpha Vantage를 호출하지 않고 Google Sheets settings!usdkrw_rate 값만 읽습니다.")
     if st.button("캐시 초기화"):
         st.cache_data.clear()
         st.cache_resource.clear()
@@ -1591,9 +1592,9 @@ if not sheet_id:
     st.stop()
 
 # 환율은 자산 탭/전략 탭 모두 필요합니다.
-# v13부터 USD/KRW 환율은 Alpha Vantage를 호출하지 않고 Google Sheets settings 시트를 우선 사용합니다.
-usdkrw_rate, usdkrw_source, usdkrw_rate_date = load_usdkrw_from_settings(float(manual_usdkrw_rate), eval_date)
-if str(usdkrw_source).startswith("수동 입력"):
+# v14부터 USD/KRW 환율은 Alpha Vantage를 호출하지 않고 Google Sheets settings 시트 값을 사용합니다.
+usdkrw_rate, usdkrw_source, usdkrw_rate_date = load_usdkrw_from_settings(DEFAULT_USDKRW_RATE, eval_date)
+if str(usdkrw_source).startswith("기본값"):
     st.warning(f"USD/KRW 환율은 {usdkrw_source} 기준 {fx_rate_krw(usdkrw_rate)}를 사용합니다. Google Sheets settings 시트의 usdkrw_rate 값을 확인하세요.")
 else:
     st.info(f"USD/KRW 환율은 Google Sheets settings 시트 값 {fx_rate_krw(usdkrw_rate)}를 사용합니다. 출처: {usdkrw_source}")
