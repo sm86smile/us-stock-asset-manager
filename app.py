@@ -1578,7 +1578,7 @@ with st.sidebar:
         st.error("GOOGLE_SHEET_ID 필요")
     eval_date = st.date_input("평가 기준일", value=today)
     st.markdown("---")
-    st.caption("환율은 Alpha Vantage를 호출하지 않고 Google Sheets settings!usdkrw_rate 값만 읽습니다.")
+
     if st.button("캐시 초기화"):
         st.cache_data.clear()
         st.cache_resource.clear()
