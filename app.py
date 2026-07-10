@@ -1577,15 +1577,7 @@ with st.sidebar:
         st.error("GOOGLE_SHEET_ID 필요")
     eval_date = st.date_input("평가 기준일", value=today)
     st.markdown("---")
-    manual_usdkrw_rate = st.number_input(
-        "수동 USD/KRW 예비 환율",
-        min_value=1.0,
-        value=1380.0,
-        step=1.0,
-        format="%.2f",
-        help="Google Sheets settings 시트의 usdkrw_rate를 우선 사용하고, 값이 없거나 오류일 때만 이 환율로 대체합니다.",
-    )
-    st.caption("환율은 Alpha Vantage를 호출하지 않고 Google Sheets settings!usdkrw_rate 값을 우선 사용합니다.")
+
     if st.button("캐시 초기화"):
         st.cache_data.clear()
         st.cache_resource.clear()
