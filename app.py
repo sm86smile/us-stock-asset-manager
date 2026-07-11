@@ -27,6 +27,11 @@ CACHE_TTL_SECONDS = 12 * 60 * 60
 DEFAULT_USDKRW_RATE = 1380.0  # settings 시트 환율을 읽지 못할 때만 사용하는 내부 기본값
 GSHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# Streamlit 세션 저장 키
+LATEST_QUOTES_SESSION_KEY = "latest_quotes_df"
+MONTHLY_DATA_SESSION_KEY = "monthly_price_data"
+MONTHLY_META_SESSION_KEY = "monthly_price_meta"
+
 # 기존 ETF 자산배분 전략 구성
 LAA_FIXED = ["IWD", "GLD", "IEF"]
 LAA_VARIABLE = ["QQQ", "SHY"]
@@ -621,6 +626,7 @@ def build_rebalance_basis_rows(
     exclude_current_month: bool,
     zero_is_defensive: bool,
     use_cached_quotes_first: bool,
+    use_cached_monthly_first: bool,
 ) -> pd.DataFrame:
     """리밸런싱 주문안이 나온 계산 근거를 행 단위로 정리합니다.
 
@@ -634,7 +640,8 @@ def build_rebalance_basis_rows(
     setting_items = [
         ("조회기간", f"{lookback_months}개월", lookback_months, "VAA/ODM 수익률 계산에 사용한 월봉 개수"),
         ("진행 중인 월 데이터 제외", "Y" if exclude_current_month else "N", "", "월말 전략 계산 기준 옵션"),
-        ("수동/세션 저장 최신가 우선 사용", "Y" if use_cached_quotes_first else "N", "", "가격 API 호출 절감 옵션"),
+        ("전체 전략 최신가 조회 방식", "11개 전략 ETF 전체 API 재조회", "", "개별 조회/세션 저장 최신가 미사용"),
+        ("전체 전략 월봉 조회 방식", "11개 전략 ETF 전체 API 재조회", "", "개별 조회/세션 저장 월봉 미사용"),
         ("VAA 0점 방어 처리", "Y" if zero_is_defensive else "N", "", "Y이면 0점은 방어 신호로 처리"),
         ("USD/KRW 환율", f"{_safe_float(metadata.get('usdkrw_rate')):,.2f}", metadata.get("usdkrw_rate"), f"출처: {_safe_str(metadata.get('usdkrw_source'))}, 기준일: {_safe_str(metadata.get('usdkrw_rate_date'))}"),
         ("리밸런싱 기준금액 USD", money_usd(_safe_float(metadata.get("total_investment_usd"))), metadata.get("total_investment_usd"), _safe_str(metadata.get("investment_basis"))),
@@ -800,7 +807,7 @@ def check_alpha_error(symbol: str, data: Dict[str, object]) -> None:
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_monthly_adjusted(symbol: str, api_key: str) -> pd.DataFrame:
+def fetch_monthly_adjusted(symbol: str, api_key: str, refresh_token: str = "") -> pd.DataFrame:
     params = {"function": "TIME_SERIES_MONTHLY_ADJUSTED", "symbol": symbol, "apikey": api_key}
     response = requests.get(ALPHA_VANTAGE_URL, params=params, timeout=30)
     response.raise_for_status()
@@ -861,7 +868,7 @@ def select_fx_rate(fx_df: pd.DataFrame, eval_date: date) -> Tuple[float, pd.Time
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_global_quote(symbol: str, api_key: str) -> Dict[str, object]:
+def fetch_global_quote(symbol: str, api_key: str, refresh_token: str = "") -> Dict[str, object]:
     params = {"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": api_key}
     response = requests.get(ALPHA_VANTAGE_URL, params=params, timeout=30)
     response.raise_for_status()
@@ -879,7 +886,11 @@ def fetch_global_quote(symbol: str, api_key: str) -> Dict[str, object]:
     return {"ticker": symbol, "latest_price_usd": float(price), "price_date": latest_trading_day or "-", "source": "API"}
 
 
-def load_latest_quotes(tickers: List[str], api_key: str) -> pd.DataFrame:
+def load_latest_quotes(tickers: List[str], api_key: str, force_refresh: bool = False) -> pd.DataFrame:
+    """여러 티커의 최신가를 조회합니다.
+
+    force_refresh=True이면 Streamlit 데이터 캐시와 무관하게 각 티커를 실제 API로 새로 조회합니다.
+    """
     rows, errors = [], []
     tickers = sorted(set([str(t).upper().strip() for t in tickers if str(t).strip()]))
     if not tickers:
@@ -888,7 +899,8 @@ def load_latest_quotes(tickers: List[str], api_key: str) -> pd.DataFrame:
     progress = st.progress(0, text="최신 종가를 불러오는 중입니다.")
     for i, ticker in enumerate(tickers, start=1):
         try:
-            rows.append(fetch_global_quote(ticker, api_key))
+            refresh_token = f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{ticker}-{i}" if force_refresh else ""
+            rows.append(fetch_global_quote(ticker, api_key, refresh_token=refresh_token))
         except Exception as e:
             errors.append(str(e))
             rows.append({"ticker": ticker, "latest_price_usd": pd.NA, "price_date": "-", "source": "API_ERROR"})
@@ -908,7 +920,7 @@ def load_latest_quotes(tickers: List[str], api_key: str) -> pd.DataFrame:
 def get_cached_quotes_for_tickers(tickers: List[str]) -> pd.DataFrame:
     """세션에 저장된 최신가만 읽습니다. 이 함수는 Alpha Vantage를 호출하지 않습니다."""
     cols = ["ticker", "latest_price_usd", "price_date", "source", "fetched_at"]
-    cached = st.session_state.get("latest_quotes_df")
+    cached = st.session_state.get(LATEST_QUOTES_SESSION_KEY)
     if cached is None or not isinstance(cached, pd.DataFrame) or cached.empty:
         return pd.DataFrame(columns=cols)
 
@@ -936,15 +948,15 @@ def store_latest_quotes(quotes: pd.DataFrame) -> None:
     new_quotes["source"] = new_quotes["source"].fillna("API").astype(str)
     new_quotes["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    cached = st.session_state.get("latest_quotes_df")
+    cached = st.session_state.get(LATEST_QUOTES_SESSION_KEY)
     if cached is None or not isinstance(cached, pd.DataFrame) or cached.empty:
-        st.session_state["latest_quotes_df"] = new_quotes
+        st.session_state[LATEST_QUOTES_SESSION_KEY] = new_quotes
         return
 
     combined = pd.concat([cached, new_quotes], ignore_index=True)
     combined["ticker"] = combined["ticker"].astype(str).str.upper().str.strip()
     combined = combined.drop_duplicates(subset=["ticker"], keep="last")
-    st.session_state["latest_quotes_df"] = combined
+    st.session_state[LATEST_QUOTES_SESSION_KEY] = combined
 
 
 def quote_cache_info(quotes: pd.DataFrame) -> str:
@@ -1056,12 +1068,139 @@ def combine_cached_and_api_quotes(quote_tickers: List[str], api_key: str, use_ca
 
     return get_cached_quotes_for_tickers(tickers)
 
-def load_all_monthly_prices(tickers: List[str], api_key: str) -> Dict[str, pd.DataFrame]:
+def get_cached_monthly_prices(tickers: List[str]) -> Dict[str, pd.DataFrame]:
+    """이번 Streamlit 세션에 저장된 ETF 월봉만 반환합니다. API는 호출하지 않습니다."""
+    wanted = sorted(set(str(t).upper().strip() for t in tickers if str(t).strip()))
+    cached = st.session_state.get(MONTHLY_DATA_SESSION_KEY, {})
+    if not isinstance(cached, dict):
+        return {}
+
+    result: Dict[str, pd.DataFrame] = {}
+    for ticker in wanted:
+        df = cached.get(ticker)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            result[ticker] = df.copy()
+    return result
+
+
+def store_monthly_prices(data: Dict[str, pd.DataFrame], source: str = "API") -> None:
+    """조회한 월봉을 티커별로 세션에 저장합니다.
+
+    개별 조회 상태 표와 마지막 조회 결과 확인에 사용하며, 전체 전략 계산에서는 재사용하지 않습니다.
+    """
+    if not data:
+        return
+
+    cached = st.session_state.get(MONTHLY_DATA_SESSION_KEY, {})
+    if not isinstance(cached, dict):
+        cached = {}
+    meta = st.session_state.get(MONTHLY_META_SESSION_KEY, {})
+    if not isinstance(meta, dict):
+        meta = {}
+
+    fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for ticker, df in data.items():
+        normalized = str(ticker).upper().strip()
+        if not normalized or not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        cached[normalized] = df.copy()
+        latest_date = df.index.max().strftime("%Y-%m-%d") if isinstance(df.index, pd.DatetimeIndex) and len(df.index) else "-"
+        meta[normalized] = {
+            "ticker": normalized,
+            "source": source,
+            "fetched_at": fetched_at,
+            "latest_month": latest_date,
+            "rows": int(len(df)),
+        }
+
+    st.session_state[MONTHLY_DATA_SESSION_KEY] = cached
+    st.session_state[MONTHLY_META_SESSION_KEY] = meta
+
+
+def monthly_cache_status(tickers: List[str]) -> pd.DataFrame:
+    """전략 ETF별 월봉/최신가 세션 저장 상태를 표로 만듭니다."""
+    monthly_meta = st.session_state.get(MONTHLY_META_SESSION_KEY, {})
+    if not isinstance(monthly_meta, dict):
+        monthly_meta = {}
+
+    quote_df = get_cached_quotes_for_tickers(tickers)
+    quote_map: Dict[str, Dict[str, object]] = {}
+    if quote_df is not None and not quote_df.empty:
+        quote_work = quote_df.copy()
+        quote_work["ticker"] = quote_work["ticker"].astype(str).str.upper().str.strip()
+        quote_map = quote_work.drop_duplicates("ticker", keep="last").set_index("ticker").to_dict("index")
+
+    rows: List[Dict[str, object]] = []
+    for ticker in sorted(set(str(t).upper().strip() for t in tickers if str(t).strip())):
+        m = monthly_meta.get(ticker, {})
+        q = quote_map.get(ticker, {})
+        monthly_loaded = ticker in get_cached_monthly_prices([ticker])
+        quote_price = pd.to_numeric(q.get("latest_price_usd"), errors="coerce")
+        rows.append({
+            "ETF": ticker,
+            "자산군": ETF_LABELS.get(ticker, ""),
+            "월봉 저장": "완료" if monthly_loaded else "미조회",
+            "월봉 최신월": m.get("latest_month", "-"),
+            "월봉 조회시각": m.get("fetched_at", "-"),
+            "최신가 저장": "완료" if pd.notna(quote_price) and float(quote_price) > 0 else "미조회",
+            "최신가(USD)": float(quote_price) if pd.notna(quote_price) and float(quote_price) > 0 else pd.NA,
+            "최신가 기준일": q.get("price_date", "-"),
+            "최신가 조회시각": q.get("fetched_at", "-"),
+        })
+    return pd.DataFrame(rows)
+
+
+def load_monthly_prices_incremental(
+    tickers: List[str],
+    api_key: str,
+    use_cached_first: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    """개별 조회 월봉을 우선 재사용하고 부족한 티커만 Alpha Vantage로 호출합니다."""
+    wanted = sorted(set(str(t).upper().strip() for t in tickers if str(t).strip()))
+    if not wanted:
+        return {}
+
+    if not use_cached_first:
+        fetched = load_all_monthly_prices(wanted, api_key)
+        store_monthly_prices(fetched, source="전체 전략 조회")
+        return fetched
+
+    result = get_cached_monthly_prices(wanted)
+    missing = [ticker for ticker in wanted if ticker not in result]
+    if missing:
+        st.info(f"개별 조회로 저장되지 않은 월봉 {len(missing)}개만 API로 조회합니다: {', '.join(missing)}")
+        fetched = load_all_monthly_prices(missing, api_key)
+        store_monthly_prices(fetched, source="전체 전략 조회-부족분")
+        result.update(fetched)
+    else:
+        st.info("전략 계산에 필요한 모든 ETF 월봉이 개별 조회로 저장되어 있어 월봉 API 호출을 생략합니다.")
+    return result
+
+
+def fetch_single_monthly_price(ticker: str, api_key: str) -> pd.DataFrame:
+    """선택 ETF 월봉을 캐시와 무관하게 실제 API 1회 호출해 새로 저장합니다."""
+    refresh_token = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    return fetch_monthly_adjusted(ticker, api_key, refresh_token=refresh_token)
+
+
+def fetch_single_global_quote(ticker: str, api_key: str) -> Dict[str, object]:
+    """선택 ETF 최신가를 캐시와 무관하게 실제 API 1회 호출합니다."""
+    refresh_token = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    return fetch_global_quote(ticker, api_key, refresh_token=refresh_token)
+
+
+def load_all_monthly_prices(tickers: List[str], api_key: str, force_refresh: bool = False) -> Dict[str, pd.DataFrame]:
+    """여러 티커의 월봉을 조회합니다.
+
+    force_refresh=True이면 개별 조회 세션값과 Streamlit 데이터 캐시를 사용하지 않고
+    각 티커를 실제 API로 새로 조회합니다.
+    """
     result, errors = {}, []
     progress = st.progress(0, text="Alpha Vantage에서 ETF 월봉 데이터를 불러오는 중입니다.")
     for i, ticker in enumerate(tickers, start=1):
         try:
-            result[ticker] = fetch_monthly_adjusted(ticker, api_key)
+            refresh_token = f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{ticker}-{i}" if force_refresh else ""
+            result[ticker] = fetch_monthly_adjusted(ticker, api_key, refresh_token=refresh_token)
         except Exception as e:
             errors.append(str(e))
         progress.progress(i / len(tickers), text=f"ETF 데이터 로딩: {ticker} ({i}/{len(tickers)})")
@@ -1578,11 +1717,14 @@ with st.sidebar:
         st.error("GOOGLE_SHEET_ID 필요")
     eval_date = st.date_input("평가 기준일", value=today)
     st.markdown("---")
-
+    st.caption("환율은 Alpha Vantage를 호출하지 않고 Google Sheets settings!usdkrw_rate 값만 읽습니다.")
     if st.button("캐시 초기화"):
         st.cache_data.clear()
         st.cache_resource.clear()
-        st.success("캐시를 초기화했습니다.")
+        st.session_state.pop(LATEST_QUOTES_SESSION_KEY, None)
+        st.session_state.pop(MONTHLY_DATA_SESSION_KEY, None)
+        st.session_state.pop(MONTHLY_META_SESSION_KEY, None)
+        st.success("API 캐시와 세션에 저장된 최신가/월봉 데이터를 초기화했습니다.")
 
 if not api_key:
     st.warning("Streamlit Secrets에 ALPHA_VANTAGE_API_KEY를 저장한 뒤 실행하세요.")
@@ -1682,11 +1824,73 @@ with tab_strategy:
         odm_monthly_last = strategy_rebalance_dates["odm"]["last_date"]
         st.caption("최근 리밸런싱일은 위 일정표의 전략별 대상 ETF 최신 매매일을 자동 사용합니다.")
         zero_is_defensive = st.checkbox("VAA 모멘텀 스코어 0점은 방어 신호로 처리", value=True)
-        use_cached_quotes_first = st.checkbox(
-            "수동/세션 저장 최신가 우선 사용",
-            value=True,
-            help="체크하면 수동 입력 또는 이전 조회 가격이 있는 티커는 재조회하지 않고, 부족한 티커만 Alpha Vantage로 조회합니다.",
+        # 전체 전략 계산에서는 개별 조회/세션 저장값을 재사용하지 않습니다.
+        # 아래 값은 계산 근거 저장 함수와의 호환성을 위해 False로 고정합니다.
+        use_cached_quotes_first = False
+        use_cached_monthly_first = False
+        st.info(
+            "전체 전략 계산을 실행하면 11개 전략 ETF의 월봉과 최신가를 모두 Alpha Vantage에서 새로 조회합니다. "
+            "개별 조회로 저장된 데이터는 전체 계산에 재사용하지 않습니다."
         )
+
+    st.markdown("#### 개별 ETF API 조회")
+    st.caption(
+        "11개 전략 ETF 중 한 종목만 선택해 최신가 또는 월봉을 각각 1회 호출할 수 있습니다. "
+        "조회 결과는 이번 앱 세션에 저장되지만, 전체 전략 계산 버튼을 누르면 이 저장값과 관계없이 11개 ETF를 모두 새로 조회합니다."
+    )
+    individual_cols = st.columns([2, 1, 1, 1])
+    selected_individual_ticker = individual_cols[0].selectbox(
+        "개별 조회 ETF",
+        options=ALL_TICKERS,
+        format_func=lambda ticker: f"{ticker} · {ETF_LABELS.get(ticker, '')}",
+        key="individual_strategy_ticker",
+    )
+    if individual_cols[1].button("최신가 API 조회 (1회)", key="individual_quote_api"):
+        try:
+            quote_row = fetch_single_global_quote(selected_individual_ticker, api_key)
+            quote_row["source"] = "API_INDIVIDUAL"
+            store_latest_quotes(pd.DataFrame([quote_row]))
+            st.success(
+                f"{selected_individual_ticker} 최신가를 개별 조회했습니다: "
+                f"{usd_price(float(quote_row['latest_price_usd']))} / 기준일 {quote_row.get('price_date', '-')}"
+            )
+        except Exception as e:
+            st.error(f"{selected_individual_ticker} 최신가 개별 조회 실패: {e}")
+
+    if individual_cols[2].button("월봉 API 조회 (1회)", key="individual_monthly_api"):
+        try:
+            monthly_df = fetch_single_monthly_price(selected_individual_ticker, api_key)
+            store_monthly_prices({selected_individual_ticker: monthly_df}, source="API_INDIVIDUAL")
+            latest_month = monthly_df.index.max().strftime("%Y-%m-%d")
+            latest_close = float(monthly_df.loc[monthly_df.index.max(), "adjusted_close"])
+            st.success(
+                f"{selected_individual_ticker} 월봉을 개별 조회했습니다: "
+                f"최신월 {latest_month} / 조정종가 {latest_close:,.2f} / {len(monthly_df):,}개 월"
+            )
+        except Exception as e:
+            st.error(f"{selected_individual_ticker} 월봉 개별 조회 실패: {e}")
+
+    if individual_cols[3].button("선택 ETF 저장값 삭제", key="individual_clear_api"):
+        cached_monthly = st.session_state.get(MONTHLY_DATA_SESSION_KEY, {})
+        monthly_meta = st.session_state.get(MONTHLY_META_SESSION_KEY, {})
+        if isinstance(cached_monthly, dict):
+            cached_monthly.pop(selected_individual_ticker, None)
+            st.session_state[MONTHLY_DATA_SESSION_KEY] = cached_monthly
+        if isinstance(monthly_meta, dict):
+            monthly_meta.pop(selected_individual_ticker, None)
+            st.session_state[MONTHLY_META_SESSION_KEY] = monthly_meta
+        cached_quotes = st.session_state.get(LATEST_QUOTES_SESSION_KEY)
+        if isinstance(cached_quotes, pd.DataFrame) and not cached_quotes.empty and "ticker" in cached_quotes.columns:
+            keep = cached_quotes["ticker"].astype(str).str.upper().str.strip() != selected_individual_ticker
+            st.session_state[LATEST_QUOTES_SESSION_KEY] = cached_quotes.loc[keep].copy()
+        st.success(f"{selected_individual_ticker}의 세션 저장 최신가와 월봉을 삭제했습니다.")
+
+    with st.expander("11개 ETF 개별 조회 저장 상태", expanded=False):
+        status_df = monthly_cache_status(ALL_TICKERS)
+        status_show = status_df.copy()
+        if "최신가(USD)" in status_show.columns:
+            status_show["최신가(USD)"] = status_show["최신가(USD)"].apply(lambda x: usd_price(x) if pd.notna(x) else "-")
+        st.dataframe(status_show, use_container_width=True, hide_index=True)
 
     st.markdown("#### 하위전략 비중")
     wc1, wc2, wc3 = st.columns(3)
@@ -1720,12 +1924,22 @@ with tab_strategy:
     pc2.metric("리밸런싱 기준금액(KRW)", preview_label_krw)
     pc3.metric("현재 포트폴리오 총자산", money_usd(portfolio_summary["total_usd"]) if not portfolio_quotes.empty or positions_base.empty else "최신가 미조회")
     pc4.metric("적용 환율", fx_rate_krw(usdkrw_rate))
-    st.caption("매매일지 입력/저장 단계에서는 가격 API를 호출하지 않습니다. 이 버튼을 누를 때 LAA/VAA/ODM 전략 전체 ETF와 현재 보유종목 최신가 조회를 묶어서 실행합니다.")
+    st.caption(
+        "매매일지 입력/저장 단계에서는 가격 API를 호출하지 않습니다. "
+        "전체 계산 버튼은 개별 조회 저장값을 재사용하지 않고 11개 전략 ETF의 월봉과 최신가를 모두 새로 API 조회합니다."
+    )
 
     run = st.button("ETF 전략 계산 및 현재 보유수량 반영", type="primary")
     if run:
-        data = load_all_monthly_prices(DATA_TICKERS, api_key)
-        prices = build_price_matrix(data, DATA_TICKERS, eval_date, lookback_months, exclude_current_month)
+        st.warning(
+            "이번 전체 계산은 11개 ETF 월봉 11회 + 최신가 11회로 최소 22회의 Alpha Vantage API를 호출합니다. "
+            "현재 보유종목 중 전략 외 티커가 있으면 최신가 호출이 추가됩니다."
+        )
+
+        # 전체 전략 계산은 개별 조회/세션 저장값을 사용하지 않고 11개 ETF 월봉을 전부 새로 조회합니다.
+        data = load_all_monthly_prices(ALL_TICKERS, api_key, force_refresh=True)
+        store_monthly_prices(data, source="API_FULL_11_STRATEGY")
+        prices = build_price_matrix(data, ALL_TICKERS, eval_date, lookback_months, exclude_current_month)
         if prices.empty:
             st.error("ETF 월봉 데이터를 가져오지 못했습니다. API Key/호출 제한/기준일을 확인하세요.")
             st.stop()
@@ -1749,13 +1963,13 @@ with tab_strategy:
             st.error(str(e))
             st.stop()
 
-        # 최신가 조회는 이 지점에서 한 번만 실행합니다.
-        # 대상: LAA/VAA/ODM 전략에 등장하는 모든 ETF + 현재 보유종목.
-        # 이렇게 조회한 가격표를 1) 현재 총자산 평가와 2) 리밸런싱 주문안 계산에 함께 사용합니다.
+        # 최신가도 개별 조회/세션 저장값을 사용하지 않고 11개 전략 ETF 전체를 새로 조회합니다.
+        # 현재 보유종목 중 전략 외 티커가 있으면 총자산 평가를 위해 해당 티커도 함께 새로 조회합니다.
         strategy_price_tickers = ALL_TICKERS.copy()
         holding_tickers = positions_base["ticker"].dropna().astype(str).str.upper().str.strip().tolist()
         quote_tickers = sorted(set(strategy_price_tickers + holding_tickers))
-        quote_df = combine_cached_and_api_quotes(quote_tickers, api_key, use_cached_quotes_first)
+        quote_df = load_latest_quotes(quote_tickers, api_key, force_refresh=True)
+        store_latest_quotes(quote_df)
         portfolio_status_run, portfolio_summary_run = build_portfolio_status(positions_base, quote_df, cash_balance, usdkrw_rate)
 
         # 2) 리밸런싱 탭에서 조회한 가격을 1) 자산/매매일지 탭의 총자산 계산에도 즉시 재사용합니다.
@@ -1851,6 +2065,7 @@ with tab_strategy:
             exclude_current_month,
             zero_is_defensive,
             use_cached_quotes_first,
+            use_cached_monthly_first,
         )
         save_rebalance_basis_to_sheet(basis_df)
         saved_rebalance_plan_df = load_saved_rebalance_plan()
@@ -1912,7 +2127,7 @@ with tab_assets:
             portfolio_status, portfolio_summary = build_portfolio_status(positions_base, portfolio_quotes, cash_balance, usdkrw_rate)
             st.success("현재 보유종목 최신가를 조회해 이번 세션에 저장했습니다.")
     if refresh_cols[1].button("저장된 최신가 지우기"):
-        st.session_state["latest_quotes_df"] = pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date", "source", "fetched_at"])
+        st.session_state[LATEST_QUOTES_SESSION_KEY] = pd.DataFrame(columns=["ticker", "latest_price_usd", "price_date", "source", "fetched_at"])
         portfolio_quotes = get_cached_quotes_for_tickers(positions_base["ticker"].tolist())
         portfolio_status, portfolio_summary = build_portfolio_status(positions_base, portfolio_quotes, cash_balance, usdkrw_rate)
         st.success("이번 세션에 저장된 최신가를 지웠습니다.")
