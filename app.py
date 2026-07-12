@@ -148,46 +148,153 @@ def get_secret_sheet_id() -> str:
         return ""
 
 
+def _to_float_for_display(x: object):
+    """표시용 숫자 변환. 변환 불가 문자열은 None 반환."""
+    if x is None:
+        return None
+
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(x, str):
+        s = x.strip()
+        if s == "" or s == "-":
+            return None
+        if s.lower() in {"nan", "none", "nat", "null", "<na>"}:
+            return None
+
+        # 이미 통화/퍼센트/단위가 붙은 문자열도 숫자 부분만 최대한 읽습니다.
+        s = (
+            s.replace(",", "")
+            .replace("$", "")
+            .replace("원/USD", "")
+            .replace("원", "")
+            .replace("주", "")
+            .strip()
+        )
+
+        # 퍼센트 문자열은 호출 함수에서 별도 처리해야 하므로 %는 제거만 합니다.
+        if s.endswith("%"):
+            s = s[:-1].strip()
+
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
 def money_krw(x: float) -> str:
-    if pd.isna(x):
+    value = _to_float_for_display(x)
+    if value is None:
         return "-"
-    return f"{int(round(float(x))):,}원"
+    return f"{int(round(value)):,}원"
 
 
 def money_usd(x: float) -> str:
-    if pd.isna(x):
+    value = _to_float_for_display(x)
+    if value is None:
         return "-"
-    return f"${float(x):,.2f}"
+    return f"${value:,.2f}"
 
 
 def usd_price(x: float) -> str:
-    if pd.isna(x):
+    value = _to_float_for_display(x)
+    if value is None:
         return "-"
-    return f"${float(x):,.2f}"
+    return f"${value:,.2f}"
 
 
 def fx_rate_krw(x: float) -> str:
-    if pd.isna(x):
+    value = _to_float_for_display(x)
+    if value is None:
         return "-"
-    return f"{float(x):,.2f}원/USD"
+    return f"{value:,.2f}원/USD"
 
 
 def format_pct(x: float, digits: int = 2) -> str:
-    if pd.isna(x):
+    """
+    숫자형 비율을 퍼센트 문자열로 변환합니다.
+
+    안전 처리:
+    - 0.1234      -> 12.34%
+    - "0.1234"    -> 12.34%
+    - "12.34%"    -> 12.34%
+    - "", "-", NaN, None -> "-"
+    - 숫자로 바꿀 수 없는 문자열은 원문 그대로 반환
+
+    Google Sheets에 이미 %가 붙어 저장된 값이 다시 들어와도
+    float() 변환 오류로 앱이 중단되지 않게 합니다.
+    """
+    if x is None:
         return "-"
-    return f"{float(x) * 100:.{digits}f}%"
+
+    try:
+        if pd.isna(x):
+            return "-"
+    except Exception:
+        pass
+
+    if isinstance(x, str):
+        s = x.strip()
+
+        if s == "" or s == "-":
+            return "-"
+
+        if s.lower() in {"nan", "none", "nat", "null", "<na>"}:
+            return "-"
+
+        if s.endswith("%"):
+            raw = s.replace("%", "").replace(",", "").strip()
+            try:
+                return f"{float(raw):.{digits}f}%"
+            except Exception:
+                return s
+
+        value = _to_float_for_display(s)
+        if value is None:
+            return x
+    else:
+        value = _to_float_for_display(x)
+        if value is None:
+            return "-"
+
+    return f"{value * 100:.{digits}f}%"
 
 
 def format_score(x: float) -> str:
-    if pd.isna(x):
+    value = _to_float_for_display(x)
+    if value is None:
         return "-"
-    return f"{float(x):.4f}"
+    return f"{value:.4f}"
+
+
+def format_number(x: object, digits: int = 4) -> str:
+    value = _to_float_for_display(x)
+    if value is None:
+        return ""
+    return f"{value:,.{digits}f}"
+
+
+def format_rank(x: object) -> str:
+    value = _to_float_for_display(x)
+    if value is None:
+        return ""
+    return f"{value:.0f}"
 
 
 def format_fractional_shares(x: float) -> str:
-    if pd.isna(x):
+    value = _to_float_for_display(x)
+    if value is None:
         return "-"
-    return f"{float(x):,.2f}주"
+    return f"{value:,.2f}주"
 
 
 def pct_cols(df: pd.DataFrame, cols: List[str], digits: int = 2) -> pd.DataFrame:
@@ -870,13 +977,13 @@ def format_saved_rebalance_basis(df: pd.DataFrame) -> pd.DataFrame:
     })
     for col in ["1개월 수익률", "3개월 수익률", "6개월 수익률", "12개월 수익률"]:
         if col in show.columns:
-            show[col] = show[col].apply(lambda x: format_pct(x) if pd.notna(x) else "")
+            show[col] = show[col].apply(format_pct)
     if "모멘텀 스코어" in show.columns:
-        show["모멘텀 스코어"] = show["모멘텀 스코어"].apply(lambda x: format_score(x) if pd.notna(x) else "")
+        show["모멘텀 스코어"] = show["모멘텀 스코어"].apply(format_score)
     if "수치값" in show.columns:
-        show["수치값"] = show["수치값"].apply(lambda x: f"{float(x):,.4f}" if pd.notna(x) else "")
+        show["수치값"] = show["수치값"].apply(format_number)
     if "순위" in show.columns:
-        show["순위"] = show["순위"].apply(lambda x: f"{float(x):.0f}" if pd.notna(x) else "")
+        show["순위"] = show["순위"].apply(format_rank)
     return show
 
 def get_latest_cash_balance() -> Dict[str, float]:
