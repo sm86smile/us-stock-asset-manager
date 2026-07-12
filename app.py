@@ -88,6 +88,13 @@ REBALANCE_PLAN_COLUMNS = [
     "next_rebalance_date",
     "rebalance_status",
     "note",
+    # 기존 rebalance_plan 열 순서를 유지하기 위해 신규 최적화 항목은 마지막에 추가합니다.
+    "optimized_value_usd",
+    "optimized_value_krw",
+    "optimized_weight",
+    "weight_gap",
+    "estimated_cash_usd",
+    "estimated_cash_krw",
 ]
 
 
@@ -458,6 +465,12 @@ def save_rebalance_plan_to_sheet(plan: pd.DataFrame, metadata: Dict[str, object]
             "price_date": _safe_str(row.get("price_date")),
             "price_source": _safe_str(row.get("source")),
             "target_shares": _safe_float(row.get("목표 주수"), default=float("nan")),
+            "optimized_value_usd": _safe_float(row.get("리밸런싱 후 평가액(USD)"), default=float("nan")),
+            "optimized_value_krw": _safe_float(row.get("리밸런싱 후 평가액(KRW)"), default=float("nan")),
+            "optimized_weight": _safe_float(row.get("리밸런싱 후 비중"), default=float("nan")),
+            "weight_gap": _safe_float(row.get("목표 대비 비중차"), default=float("nan")),
+            "estimated_cash_usd": _safe_float(row.get("예상 잔여 현금(USD)"), default=float("nan")),
+            "estimated_cash_krw": _safe_float(row.get("예상 잔여 현금(KRW)"), default=float("nan")),
             "current_shares": _safe_float(row.get("현재 주수")),
             "trade_action": _safe_str(row.get("매매 구분")),
             "trade_shares": _safe_float(row.get("매매 필요 주수"), default=float("nan")),
@@ -489,6 +502,12 @@ def load_saved_rebalance_plan() -> pd.DataFrame:
         "current_weight",
         "latest_price_usd",
         "target_shares",
+        "optimized_value_usd",
+        "optimized_value_krw",
+        "optimized_weight",
+        "weight_gap",
+        "estimated_cash_usd",
+        "estimated_cash_krw",
         "current_shares",
         "trade_shares",
         "trade_amount_usd",
@@ -523,6 +542,12 @@ def format_saved_rebalance_plan(df: pd.DataFrame) -> pd.DataFrame:
         "price_date": "가격 기준일",
         "price_source": "가격 출처",
         "target_shares": "목표 주수",
+        "optimized_value_usd": "리밸런싱 후 평가액(USD)",
+        "optimized_value_krw": "리밸런싱 후 평가액(KRW)",
+        "optimized_weight": "리밸런싱 후 비중",
+        "weight_gap": "목표 대비 비중차",
+        "estimated_cash_usd": "예상 잔여 현금(USD)",
+        "estimated_cash_krw": "예상 잔여 현금(KRW)",
         "current_shares": "현재 주수",
         "trade_action": "매매 구분",
         "trade_shares": "매매 필요 주수",
@@ -534,17 +559,18 @@ def format_saved_rebalance_plan(df: pd.DataFrame) -> pd.DataFrame:
     preferred_cols = [
         "저장시각", "전략 기준월", "티커", "자산군", "목표비중", "목표금액(USD)", "목표금액(KRW)",
         "현재수량", "현재평가액(USD)", "현재평가액(KRW)", "현재비중", "최근가(USD)", "가격 기준일", "가격 출처",
-        "목표 주수", "현재 주수", "매매 구분", "매매 필요 주수", "매매 필요 금액(USD)", "매매 필요 금액(KRW)",
+        "목표 주수", "리밸런싱 후 평가액(USD)", "리밸런싱 후 평가액(KRW)", "리밸런싱 후 비중", "목표 대비 비중차",
+        "예상 잔여 현금(USD)", "예상 잔여 현금(KRW)", "현재 주수", "매매 구분", "매매 필요 주수", "매매 필요 금액(USD)", "매매 필요 금액(KRW)",
         "다음 리밸런싱일", "리밸런싱 상태",
     ]
     show = show[[c for c in preferred_cols if c in show.columns]]
-    for col in ["목표비중", "현재비중"]:
+    for col in ["목표비중", "현재비중", "리밸런싱 후 비중", "목표 대비 비중차"]:
         if col in show.columns:
             show[col] = show[col].apply(format_pct)
-    for col in ["목표금액(USD)", "현재평가액(USD)", "매매 필요 금액(USD)"]:
+    for col in ["목표금액(USD)", "현재평가액(USD)", "리밸런싱 후 평가액(USD)", "예상 잔여 현금(USD)", "매매 필요 금액(USD)"]:
         if col in show.columns:
             show[col] = show[col].apply(money_usd)
-    for col in ["목표금액(KRW)", "현재평가액(KRW)", "매매 필요 금액(KRW)"]:
+    for col in ["목표금액(KRW)", "현재평가액(KRW)", "리밸런싱 후 평가액(KRW)", "예상 잔여 현금(KRW)", "매매 필요 금액(KRW)"]:
         if col in show.columns:
             show[col] = show[col].apply(money_krw)
     if "최근가(USD)" in show.columns:
@@ -557,16 +583,18 @@ def format_saved_rebalance_plan(df: pd.DataFrame) -> pd.DataFrame:
 
 def saved_rebalance_summary(df: pd.DataFrame) -> Dict[str, object]:
     if df is None or df.empty:
-        return {"saved_at": "-", "total_usd": 0.0, "total_krw": 0.0, "buy_usd": 0.0, "sell_usd": 0.0}
+        return {"saved_at": "-", "total_usd": 0.0, "total_krw": 0.0, "buy_usd": 0.0, "sell_usd": 0.0, "estimated_cash_usd": 0.0}
     buy_usd = df.loc[df["trade_action"] == "BUY", "trade_amount_usd"].dropna().sum() if "trade_action" in df.columns else 0.0
     sell_usd = df.loc[df["trade_action"] == "SELL", "trade_amount_usd"].dropna().sum() if "trade_action" in df.columns else 0.0
     first = df.iloc[0]
+    estimated_cash_usd = _safe_float(first.get("estimated_cash_usd")) if "estimated_cash_usd" in df.columns else 0.0
     return {
         "saved_at": _safe_str(first.get("saved_at")),
         "total_usd": _safe_float(first.get("total_investment_usd")),
         "total_krw": _safe_float(first.get("total_investment_krw")),
         "buy_usd": float(buy_usd),
         "sell_usd": float(sell_usd),
+        "estimated_cash_usd": estimated_cash_usd,
         "strategy_price_month": _safe_str(first.get("strategy_price_month")),
     }
 
@@ -767,7 +795,16 @@ def build_rebalance_basis_rows(
                 saved_at, metadata, "주문안 산식 근거", _safe_str(r.get("하위전략", "최종")), _safe_str(r.get("ticker")), _safe_str(r.get("자산군")),
                 item="목표주수-현재주수", value=f"목표 {_safe_float(r.get('목표 주수'), default=float('nan')):,.2f}주 - 현재 {_safe_float(r.get('현재 주수')):,.2f}주 = {_safe_float(r.get('매매 필요 주수'), default=float('nan')):,.2f}주", value_numeric=r.get("매매 필요 금액(USD)", ""),
                 selected=_safe_str(r.get("매매 구분")), decision_reason=f"매매 구분: {_safe_str(r.get('매매 구분'))}",
-                source_note="목표 주수 = floor(목표 투자금 USD / 최근가 USD)",
+                source_note="목표금액 기준 정수 주수를 먼저 계산한 뒤, 남은 현금으로 추가 매수 가능한 ETF 중 전체 목표비중 오차가 가장 작은 종목을 1주씩 배정",
+            ))
+        cash_values = pd.to_numeric(plan.get("예상 잔여 현금(USD)"), errors="coerce").dropna() if "예상 잔여 현금(USD)" in plan.columns else pd.Series(dtype=float)
+        if not cash_values.empty:
+            estimated_cash_usd = float(cash_values.iloc[0])
+            rows.append(_basis_row(
+                saved_at, metadata, "주문안 산식 근거", "최종", item="정수 주수 최적화 후 예상 잔여 현금",
+                value=money_usd(estimated_cash_usd), value_numeric=estimated_cash_usd,
+                decision_reason="더 이상 남은 현금으로 전략 대상 ETF를 1주도 추가 매수할 수 없는 상태",
+                source_note="일부 종목의 최종 비중은 목표비중을 소폭 초과할 수 있으며, 추가 배정 시 전체 목표비중 제곱오차가 가장 작은 ETF를 선택",
             ))
 
     # Alpha Vantage 월봉 RAW 저장
@@ -1329,6 +1366,76 @@ def allocation_rows(strategy: str, strategy_weight: float, inner_weights: Dict[s
     return rows
 
 
+def optimize_target_shares_min_cash(plan: pd.DataFrame) -> Tuple[Dict[int, int], float, float]:
+    """정수 주수 제약에서 잔여 현금을 줄이면서 목표비중에 가깝게 배분합니다.
+
+    1) 각 ETF 목표금액을 가격으로 나눈 값을 우선 내림합니다.
+    2) 남은 현금으로 1주 이상 살 수 있는 동안, 추가 1주 매수 후의
+       전체 목표비중 제곱오차가 가장 작은 ETF를 선택합니다.
+    3) 오차가 같으면 매수 후 남는 현금이 더 적은 ETF를 선택합니다.
+
+    목표비중이 0인 전략 외 보유종목과 가격이 없는 종목은 추가 배정에서 제외합니다.
+    가격이 없는 목표종목의 목표금액은 다른 종목에 임의 재배분하지 않고 현금으로 남깁니다.
+    """
+    if plan is None or plan.empty:
+        return {}, 0.0, 0.0
+
+    work = plan.copy()
+    work["전략 전체 비중"] = pd.to_numeric(work.get("전략 전체 비중"), errors="coerce").fillna(0.0)
+    work["목표 투자금(USD)"] = pd.to_numeric(work.get("목표 투자금(USD)"), errors="coerce").fillna(0.0)
+    work["latest_price_usd"] = pd.to_numeric(work.get("latest_price_usd"), errors="coerce")
+
+    target_mask = (work["전략 전체 비중"] > 0) & (work["목표 투자금(USD)"] > 0)
+    total_budget = float(work.loc[target_mask, "목표 투자금(USD)"].sum())
+    valid_mask = target_mask & work["latest_price_usd"].notna() & (work["latest_price_usd"] > 0)
+    valid_indices = work.index[valid_mask].tolist()
+
+    shares: Dict[int, int] = {}
+    for idx in valid_indices:
+        target_usd = float(work.at[idx, "목표 투자금(USD)"])
+        price = float(work.at[idx, "latest_price_usd"])
+        shares[idx] = max(0, math.floor(target_usd / price))
+
+    invested = sum(shares[idx] * float(work.at[idx, "latest_price_usd"]) for idx in valid_indices)
+    # 가격이 확인된 종목에 배정된 예산 안에서만 추가 주수를 배분합니다.
+    valid_budget = float(work.loc[valid_mask, "목표 투자금(USD)"].sum())
+    allocatable_cash = max(0.0, valid_budget - invested)
+    tolerance = 1e-9
+
+    def tracking_error(candidate_shares: Dict[int, int]) -> float:
+        if total_budget <= 0:
+            return 0.0
+        error = 0.0
+        for idx in valid_indices:
+            price = float(work.at[idx, "latest_price_usd"])
+            actual_weight = candidate_shares[idx] * price / total_budget
+            target_weight = float(work.at[idx, "전략 전체 비중"])
+            error += (actual_weight - target_weight) ** 2
+        return error
+
+    while True:
+        affordable = [idx for idx in valid_indices if float(work.at[idx, "latest_price_usd"]) <= allocatable_cash + tolerance]
+        if not affordable:
+            break
+
+        candidates = []
+        for idx in affordable:
+            candidate = dict(shares)
+            candidate[idx] += 1
+            price = float(work.at[idx, "latest_price_usd"])
+            cash_after = max(0.0, allocatable_cash - price)
+            candidates.append((tracking_error(candidate), cash_after, str(work.at[idx, "ticker"]), idx))
+
+        _, _, _, selected_idx = min(candidates)
+        selected_price = float(work.at[selected_idx, "latest_price_usd"])
+        shares[selected_idx] += 1
+        allocatable_cash = max(0.0, allocatable_cash - selected_price)
+
+    final_invested = sum(shares[idx] * float(work.at[idx, "latest_price_usd"]) for idx in valid_indices)
+    estimated_cash = max(0.0, total_budget - final_invested)
+    return shares, total_budget, estimated_cash
+
+
 def add_rebalance_plan(target_df: pd.DataFrame, quote_df: pd.DataFrame, positions_df: pd.DataFrame, usdkrw_rate: float) -> pd.DataFrame:
     target = target_df.copy()
     if "ETF" in target.columns:
@@ -1364,33 +1471,58 @@ def add_rebalance_plan(target_df: pd.DataFrame, quote_df: pd.DataFrame, position
     plan["market_value_usd"] = pd.to_numeric(plan["market_value_usd"], errors="coerce").fillna(0.0)
     plan["현재 평가액(KRW)"] = plan["market_value_usd"] * usdkrw_rate
 
-    target_shares, trade_shares, trade_action, trade_usd, trade_krw = [], [], [], [], []
-    for _, row in plan.iterrows():
+    optimized_shares, total_budget, estimated_cash_usd = optimize_target_shares_min_cash(plan)
+
+    target_shares, optimized_values, optimized_weights, weight_gaps = [], [], [], []
+    trade_shares, trade_action, trade_usd, trade_krw = [], [], [], []
+    for idx, row in plan.iterrows():
+        target_weight = _safe_float(row.get("전략 전체 비중"), default=0.0)
         target_usd = pd.to_numeric(row.get("목표 투자금(USD)"), errors="coerce")
         price = pd.to_numeric(row.get("latest_price_usd"), errors="coerce")
         cur_qty = float(row.get("quantity", 0.0) or 0.0)
+
         if pd.isna(target_usd) or pd.isna(price) or float(price) <= 0:
             target_shares.append(pd.NA)
+            optimized_values.append(pd.NA)
+            optimized_weights.append(pd.NA)
+            weight_gaps.append(pd.NA)
             trade_shares.append(pd.NA)
             trade_action.append("가격 확인 필요")
             trade_usd.append(pd.NA)
             trade_krw.append(pd.NA)
             continue
-        ts = math.floor(float(target_usd) / float(price))
+
+        # 전략 외 보유종목은 목표 0주, 전략 대상은 최적화된 정수 주수를 사용합니다.
+        ts = optimized_shares.get(idx, 0) if target_weight > 0 else 0
+        optimized_value = ts * float(price)
+        optimized_weight = optimized_value / total_budget if total_budget > 0 else pd.NA
+        weight_gap = optimized_weight - target_weight if pd.notna(optimized_weight) else pd.NA
         delta = ts - cur_qty
+
         if abs(delta) < 1e-9:
             action = "HOLD"
         elif delta > 0:
             action = "BUY"
         else:
             action = "SELL"
+
         amount_usd = abs(delta) * float(price)
         target_shares.append(ts)
+        optimized_values.append(optimized_value)
+        optimized_weights.append(optimized_weight)
+        weight_gaps.append(weight_gap)
         trade_shares.append(delta)
         trade_action.append(action)
         trade_usd.append(amount_usd)
         trade_krw.append(amount_usd * usdkrw_rate)
+
     plan["목표 주수"] = target_shares
+    plan["리밸런싱 후 평가액(USD)"] = optimized_values
+    plan["리밸런싱 후 평가액(KRW)"] = pd.to_numeric(plan["리밸런싱 후 평가액(USD)"], errors="coerce") * usdkrw_rate
+    plan["리밸런싱 후 비중"] = optimized_weights
+    plan["목표 대비 비중차"] = weight_gaps
+    plan["예상 잔여 현금(USD)"] = estimated_cash_usd
+    plan["예상 잔여 현금(KRW)"] = estimated_cash_usd * usdkrw_rate
     plan["현재 주수"] = plan["quantity"]
     plan["매매 구분"] = trade_action
     plan["매매 필요 주수"] = trade_shares
@@ -1453,9 +1585,9 @@ def appendix_strategy_calculation_table() -> pd.DataFrame:
         },
         {
             "구분": "목표 주수/매매 주수",
-            "계산 방식": "목표 주수 = 목표 투자금(USD) ÷ 최근가(USD) 후 소수점 버림",
-            "판정 기준": "매매 필요 주수 = 목표 주수 - 현재 보유 주수",
-            "앱 반영": "양수는 BUY, 음수는 SELL, 0은 HOLD",
+            "계산 방식": "종목별 목표금액을 기준으로 정수 주수를 우선 계산한 후, 남은 현금으로 매수 가능한 ETF를 1주씩 추가 배정",
+            "판정 기준": "추가 1주 매수 후 전체 목표비중과의 제곱오차가 가장 작은 ETF를 선택하며, 더 이상 어떤 ETF도 1주 살 수 없을 때 종료",
+            "앱 반영": "일부 ETF가 목표비중을 소폭 초과할 수 있으며, 잔여 현금을 최소화한 목표 주수에서 현재 주수를 차감해 BUY/SELL/HOLD 판정",
         },
     ])
 
@@ -1702,11 +1834,12 @@ with tab_strategy:
         st.info("아직 저장된 리밸런싱 결과가 없습니다. 아래 계산 버튼을 누르면 결과가 rebalance_plan 시트에 저장됩니다.")
     else:
         saved_summary = saved_rebalance_summary(saved_rebalance_plan_df)
-        sm1, sm2, sm3, sm4 = st.columns(4)
+        sm1, sm2, sm3, sm4, sm5 = st.columns(5)
         sm1.metric("저장시각", saved_summary["saved_at"])
         sm2.metric("저장 기준금액(USD)", money_usd(saved_summary["total_usd"]))
         sm3.metric("추가 매수 필요", money_usd(saved_summary["buy_usd"]))
         sm4.metric("매도 필요", money_usd(saved_summary["sell_usd"]))
+        sm5.metric("예상 잔여 현금", money_usd(saved_summary["estimated_cash_usd"]))
         st.caption("새로 리밸런싱 계산 버튼을 누르기 전까지 이 결과가 Google Sheets에 유지됩니다. 이 표를 보는 것만으로는 Alpha Vantage API를 호출하지 않습니다.")
         with st.expander("저장된 리밸런싱 주문안 보기", expanded=True):
             st.dataframe(format_saved_rebalance_plan(saved_rebalance_plan_df), use_container_width=True, hide_index=True)
@@ -1937,19 +2070,20 @@ with tab_strategy:
             st.dataframe(format_saved_rebalance_basis(basis_df), use_container_width=True, hide_index=True)
 
         st.markdown("#### 최종 리밸런싱 주문안")
+        st.caption("목표금액을 단순 버림한 뒤 남은 현금을 방치하지 않고, 추가 1주 매수 후 전체 목표비중 오차가 가장 작은 ETF에 반복 배정합니다. 따라서 일부 종목은 목표비중을 소폭 초과할 수 있습니다.")
         plan_display = plan.copy()
         plan_display = plan_display.rename(columns={
             "ticker": "티커", "전략 전체 비중": "목표비중", "목표 투자금(USD)": "목표금액(USD)",
             "목표 투자금(KRW)": "목표금액(KRW)", "quantity": "현재수량", "market_value_usd": "현재평가액(USD)",
             "latest_price_usd": "최근가(USD)", "price_date": "가격 기준일", "weight": "현재비중",
         })
-        for col in ["목표비중", "현재비중"]:
+        for col in ["목표비중", "현재비중", "리밸런싱 후 비중", "목표 대비 비중차"]:
             if col in plan_display.columns:
                 plan_display[col] = plan_display[col].apply(format_pct)
-        for col in ["목표금액(USD)", "현재평가액(USD)", "매매 필요 금액(USD)"]:
+        for col in ["목표금액(USD)", "현재평가액(USD)", "리밸런싱 후 평가액(USD)", "예상 잔여 현금(USD)", "매매 필요 금액(USD)"]:
             if col in plan_display.columns:
                 plan_display[col] = plan_display[col].apply(money_usd)
-        for col in ["목표금액(KRW)", "현재 평가액(KRW)", "매매 필요 금액(KRW)"]:
+        for col in ["목표금액(KRW)", "현재 평가액(KRW)", "리밸런싱 후 평가액(KRW)", "예상 잔여 현금(KRW)", "매매 필요 금액(KRW)"]:
             if col in plan_display.columns:
                 plan_display[col] = plan_display[col].apply(money_krw)
         if "최근가(USD)" in plan_display.columns:
@@ -1961,10 +2095,12 @@ with tab_strategy:
 
         buy_usd = plan.loc[plan["매매 구분"] == "BUY", "매매 필요 금액(USD)"].dropna().sum()
         sell_usd = plan.loc[plan["매매 구분"] == "SELL", "매매 필요 금액(USD)"].dropna().sum()
-        m1, m2, m3 = st.columns(3)
+        estimated_cash_usd = pd.to_numeric(plan.get("예상 잔여 현금(USD)"), errors="coerce").dropna().iloc[0] if "예상 잔여 현금(USD)" in plan.columns and plan["예상 잔여 현금(USD)"].notna().any() else 0.0
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("추가 매수 필요", money_usd(buy_usd))
         m2.metric("매도 필요", money_usd(sell_usd))
         m3.metric("순매수 필요", money_usd(buy_usd - sell_usd))
+        m4.metric("예상 잔여 현금", money_usd(estimated_cash_usd))
 
         csv = plan.to_csv(index=False, encoding="utf-8-sig")
         st.download_button("리밸런싱 주문안 CSV 다운로드", data=csv, file_name=f"rebalance_plan_{actual_eval_dt.strftime('%Y%m%d')}.csv", mime="text/csv")
